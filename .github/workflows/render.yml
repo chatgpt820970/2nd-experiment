@@ -133,9 +133,8 @@ jobs:
           echo "::warning::bgutil provider did not become ready; continuing without it"
           docker logs bgutil-provider || true
 
-      - name: Fetch local fallback tracks
-        continue-on-error: true
-        run: python scripts/download_music.py
+      # Local NCS / library tracks are not used. Songs are fetched at render
+      # time from SoundCloud / JioSaavn / etc., or the original source audio is used.
 
       - name: Render
         env:
@@ -144,7 +143,7 @@ jobs:
           HOOK: ${{ inputs.hook }}
         run: |
           mkdir -p out
-          args=(--category "$CAT" --auto --max-sources 8
+          args=(--category "$CAT" --auto --max-sources 12
                 --source-offset "$IDX" --song-offset "$IDX"
                 --out "out/${CAT}_${IDX}.mp4")
           if [ -n "$HOOK" ]; then args+=(--hook "$HOOK"); fi
