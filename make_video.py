@@ -18,6 +18,7 @@ import hashlib
 import json
 import math
 import re
+import shutil
 import subprocess
 import sys
 import traceback
@@ -30,7 +31,9 @@ from PIL import Image, ImageDraw, ImageFont
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
+import audio_mix  # noqa: E402
 import categories  # noqa: E402
+import logo  # noqa: E402
 import sourcing  # noqa: E402
 from sourcing import SourceError  # noqa: E402
 
@@ -47,7 +50,7 @@ DEVANAGARI_FONTS = [
 ]
 
 MAX_SKIP_HEAD = 9.0
-MAX_SKIP_TAIL = 16.0
+MAX_SKIP_TAIL = 22.0   # trailers end with title art / release-date cards
 DEFAULT_CUT_S = 2.33
 DEFAULT_TARGET_S = 25.7
 DEFAULT_BPM = 129.0
@@ -62,6 +65,11 @@ BANNER_H = 240
 MAX_PLATE_H = CANVAS_H - BANNER_H - 160
 QC_ROUNDS = 3          # render + up to 2 blacklist re-renders per source/track
 MIN_AUDIO_DB = -45.0   # mean volume below this = silent / broken music
+DUCK = 0.25            # music gain while a character speaks
+MAX_DIALOGUE_SHARE = 0.45
+MAX_DIALOGUE_CLIPS = 3
+MIN_DIALOGUE_OVER_MUSIC_DB = 6.0
+SONG_DIR = ROOT / "work" / "songs"
 
 
 class RenderError(RuntimeError):
@@ -194,12 +202,43 @@ def music_tracks() -> list[dict]:
 
 
 def load_music_meta(music: Path) -> dict | None:
-    return next((t for t in music_tracks() if t["file"] == music.name), None)
+    meta = next((t for t in music_tracks() if t["file"] == music.name), None)
+    if meta:
+        return meta
+    side = music.with_suffix(".json")  # downloaded songs carry a sidecar
+    if side.exists():
+        try:
+            return json.loads(side.read_text())
+        except json.JSONDecodeError:
+            return None
+    return None
 
 
-def ensure_track(name_or_path: str | Path) -> Path:
-    """Return a playable track path, downloading it from music.json if needed."""
-    p = Path(name_or_path).expanduser()
+def track_label(track) -> str:
+    return f"song {track['id']}" if isinstance(track, dict) else Path(track).name
+
+
+def ensure_track(track) -> Path:
+    """Return a playable track path.
+
+    `track` is either a song search result (dict, downloaded with yt-dlp) or a
+    local file name/path from assets/music.json (downloaded from its URL if missing).
+    """
+    if isinstance(track, dict):
+        try:
+            path = sourcing.download_audio(track, SONG_DIR, log=log)
+        except SourceError as e:
+            raise RenderError(f"song download failed: {e}")
+        title = track.get("title") or track["id"]
+        artist = track.get("channel") or "unknown"
+        path.with_suffix(".json").write_text(json.dumps({
+            "file": path.name, "title": title, "artist": artist, "source": "YouTube",
+            "url": f"https://www.youtube.com/watch?v={track['id']}",
+            "credit": f"Song: {title}\nArtist / label: {artist}",
+            "bpm": None,
+        }, indent=2, ensure_ascii=False))
+        return path
+    p = Path(track).expanduser()
     if p.exists() and p.stat().st_size > 100_000:
         return p.resolve()
     meta = next((t for t in music_tracks() if t["file"] == p.name), None)
@@ -207,7 +246,7 @@ def ensure_track(name_or_path: str | Path) -> Path:
     if dest.exists() and dest.stat().st_size > 100_000:
         return dest
     if not meta:
-        raise RenderError(f"music not found and not in music.json: {name_or_path}")
+        raise RenderError(f"music not found and not in music.json: {track}")
     sys.path.insert(0, str(ROOT / "scripts"))
     import download_music  # noqa: E402
     try:
@@ -330,15 +369,19 @@ def window_ok(rows_by_t: dict, start: float, dur: float) -> tuple[bool, float]:
     return True, float(min(specs) + 0.35 * (sum(specs) / len(specs)))
 
 
-def pick_edl(rows, head, usable_end, clip_dur, n_clips, blacklist=None) -> list[dict]:
-    blacklist = blacklist or set()
-    rows_by_t = {int(round(r["t"])): r for r in rows}
+def snap(t: float) -> float:
+    """Snap a source time to the 30 fps grid so video and audio cut at the same frame."""
+    return round(t * 30) / 30.0
+
+
+def pick_normal(rows_by_t, head, usable_end, clip_dur, n_clips, blacklist) -> list[dict]:
     cands, t = [], head
     while t + clip_dur <= usable_end - 0.05:
         ok, sc = window_ok(rows_by_t, t, clip_dur)
         secs = range(math.floor(t), math.ceil(t + clip_dur))
-        if ok and not any(s in blacklist for s in secs):
-            cands.append({"src_start": round(t, 3), "src_end": round(t + clip_dur, 3), "score": sc})
+        if ok and not any(x in blacklist for x in secs):
+            cands.append({"src_start": snap(t), "src_end": snap(t) + clip_dur, "score": sc,
+                          "k": 1, "speech": []})
         t += 0.5
     cands.sort(key=lambda c: -c["score"])
     picked = []
@@ -351,12 +394,91 @@ def pick_edl(rows, head, usable_end, clip_dur, n_clips, blacklist=None) -> list[
             picked.append(c)
     if len(picked) < n_clips:
         raise SourceError(f"only {len(picked)} clean non-overlapping clips, need {n_clips}")
-    reveal_i = min(REVEAL_INDEX, n_clips - 1)
-    reveal = max(picked, key=lambda c: c["score"])
-    rest = sorted([c for c in picked if c is not reveal], key=lambda c: c["src_start"])
-    edl = rest[:reveal_i] + [reveal] + rest[reveal_i:]
+    return picked
+
+
+def pick_dialogue(rows_by_t, speech, src_audio, head, usable_end, clip_dur, max_units, blacklist):
+    """Clips that hold one complete spoken line (1-3 beat units long).
+
+    The window starts shortly before the line and both cut points fall in a
+    speech gap, so nobody is cut off mid-sentence. Cut length stays a whole
+    number of beat units, so the edit stays on the beat.
+    """
+    if not speech or max_units <= 0:
+        return []
+    groups = audio_mix._merge(speech, gap=0.35, min_len=0.6)
+    cands = []
+    for s0, e0 in groups:
+        d = e0 - s0
+        if d > 3 * clip_dur - 0.3:
+            continue
+        k = max(1, math.ceil((d + 0.3) / clip_dur))
+        L = k * clip_dur
+        slack = L - d
+        prefer = slack * 0.4
+        best = None
+        lead = 0.12
+        while lead <= slack - 0.12 + 1e-9:
+            ws = snap(s0 - lead)
+            we = ws + L
+            lead += 0.04
+            if ws < head or we > usable_end - 0.05:
+                continue
+            if any(a - 0.05 < ws < b + 0.05 or a - 0.05 < we < b + 0.05 for a, b in speech):
+                continue  # a cut point would chop another line
+            if any(x in blacklist for x in range(math.floor(ws), math.ceil(we))):
+                continue
+            ok, sc = window_ok(rows_by_t, ws, L)
+            if not ok:
+                continue
+            if best is None or abs((s0 - ws) - prefer) < abs((s0 - best[0]) - prefer):
+                best = (ws, we, sc)
+        if not best:
+            continue
+        ws, we, sc = best
+        clar = audio_mix.clarity_db(src_audio, s0, e0) if src_audio.size else 0.0
+        cands.append({"src_start": ws, "src_end": we, "k": k, "dialogue": True,
+                      "speech": [(max(a, ws), min(b, we)) for a, b in speech if b > ws and a < we],
+                      "line": (round(s0, 2), round(e0, 2)), "clarity_db": round(clar, 1),
+                      "score": sc + 1.5 * min(clar, 12) + 8 * (d / L)})
+    cands.sort(key=lambda c: -c["score"])
+    picked, units = [], 0
+    for c in cands:
+        if len(picked) >= MAX_DIALOGUE_CLIPS or units + c["k"] > max_units:
+            continue
+        if any(c["src_start"] < p["src_end"] + 2 and p["src_start"] < c["src_end"] + 2 for p in picked):
+            continue
+        picked.append(c)
+        units += c["k"]
+    return picked
+
+
+def build_edl(rows, speech, src_audio, head, usable_end, clip_dur, n_units, blacklist=None) -> list[dict]:
+    blacklist = set(blacklist or ())
+    rows_by_t = {int(round(r["t"])): r for r in rows}
+    max_dlg = int(n_units * MAX_DIALOGUE_SHARE)
+    dlg = pick_dialogue(rows_by_t, speech, src_audio, head, usable_end, clip_dur, max_dlg, blacklist)
+    normal_bl = set(blacklist)
+    for c in dlg:  # don't reuse dialogue footage as an action cut
+        normal_bl.update(range(math.floor(c["src_start"]) - 1, math.ceil(c["src_end"]) + 1))
+    normal_n = n_units - sum(c["k"] for c in dlg)
+    try:
+        normal = pick_normal(rows_by_t, head, usable_end, clip_dur, normal_n, normal_bl)
+    except SourceError:
+        if not dlg:
+            raise
+        log("  not enough action cuts next to dialogue clips; dropping dialogue clips")
+        dlg, normal = [], pick_normal(rows_by_t, head, usable_end, clip_dur, n_units, blacklist)
+    reveal = max(normal, key=lambda c: c["score"])
+    rest = sorted([c for c in normal + dlg if c is not reveal], key=lambda c: c["src_start"])
+    ri = min(REVEAL_INDEX, len(rest))
+    edl = rest[:ri] + [reveal] + rest[ri:]
+    t = 0.0
     for i, c in enumerate(edl):
-        c.update(i=i, t0=i * clip_dur, t1=(i + 1) * clip_dur, reveal=(i == reveal_i))
+        dur = c["k"] * clip_dur
+        c.update(i=i, t0=round(t, 4), t1=round(t + dur, 4), reveal=(c is reveal))
+        c["src_end"] = c["src_start"] + dur
+        t += dur
     return edl
 
 
@@ -418,7 +540,7 @@ def write_caption_txt(out_path: Path, music: Path, hook: str, preset: dict | Non
     src_line = ""
     if src_info.get("title"):
         src_line = f"Source: {src_info['title']}" + (f" ({src_info['url']})" if src_info.get("url") else "") + "\n"
-    body = (f"{hook_line} 🔥\nComment mein batao 👇\n{tags}\n\n{src_line}\n{credit}\n")
+    body = (f"{hook_line} 🔥\nComment mein batao 👇\n{tags}\n\n{src_line}{credit}\n")
     cap = out_path.with_name(out_path.stem + ".caption.txt")
     cap.parent.mkdir(parents=True, exist_ok=True)
     cap.write_text(body, encoding="utf-8")
@@ -430,8 +552,10 @@ def write_caption_txt(out_path: Path, music: Path, hook: str, preset: dict | Non
 def render_raw(source: Path, edl, raw_path: Path, target: float):
     parts, labels = [], []
     for i, c in enumerate(edl):
-        parts.append(f"[0:v]trim=start={c['src_start']}:end={c['src_end']},setpts=PTS-STARTPTS,"
-                     f"fps=30,format=yuv420p[v{i}]")
+        f0 = int(round(c["src_start"] * 30))
+        f1 = int(round(c["src_end"] * 30))
+        parts.append(f"[0:v]fps=30,trim=start_frame={f0}:end_frame={f1},setpts=PTS-STARTPTS,"
+                     f"format=yuv420p[v{i}]")
         labels.append(f"[v{i}]")
     parts.append("".join(labels) + f"concat=n={len(edl)}:v=1:a=0[vout]")
     run(["ffmpeg", "-y", "-v", "error", "-i", source, "-filter_complex", ";".join(parts),
@@ -439,8 +563,7 @@ def render_raw(source: Path, edl, raw_path: Path, target: float):
          "-pix_fmt", "yuv420p", "-r", "30", "-t", f"{target:.4f}", raw_path])
 
 
-def render_final(raw_path, music, banner_png, music_start, target, out_path, layout, bg_brightness):
-    fade_start = max(0.0, target - 1.2)
+def render_final(raw_path, mix_wav, banner_png, target, out_path, layout, bg_brightness):
     L = layout
     vf = (
         f"[0:v]crop=iw:{L['act_src_h']}:0:{L['act_src_y']},"
@@ -450,18 +573,25 @@ def render_final(raw_path, music, banner_png, music_start, target, out_path, lay
         f"[2:v]scale={CANVAS_W}:{BANNER_H},setsar=1,format=yuv420p[bn];"
         f"[bg][bn]overlay=x=0:y={L['banner_y']}:shortest=1[b1];"
         f"[b1][fg]overlay=x={L['plate_x']}:y={L['plate_y']},format=yuv420p[v];"
-        f"[1:a]atrim=start={music_start:.4f},asetpts=PTS-STARTPTS,"
-        f"afade=t=in:st=0:d=0.25,afade=t=out:st={fade_start:.3f}:d=1.2,"
-        f"volume=0.95,aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,"
+        f"[1:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,"
         f"apad=whole_dur={target:.4f}[a]"
     )
     out_path.parent.mkdir(parents=True, exist_ok=True)
     tmp = out_path.with_name(out_path.stem + ".tmp.mp4")
-    run(["ffmpeg", "-y", "-v", "error", "-i", raw_path, "-i", music, "-loop", "1", "-i", banner_png,
+    run(["ffmpeg", "-y", "-v", "error", "-i", raw_path, "-i", mix_wav, "-loop", "1", "-i", banner_png,
          "-filter_complex", vf, "-map", "[v]", "-map", "[a]",
          "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p", "-r", "30",
          "-c:a", "aac", "-b:a", "192k", "-t", f"{target:.4f}", "-movflags", "+faststart", tmp])
     tmp.replace(out_path)
+
+
+def segment_db(path: Path, s: float, e: float) -> float:
+    """Mean volume of [s, e] of a rendered file (ffmpeg volumedetect)."""
+    r = subprocess.run(["ffmpeg", "-v", "info", "-ss", f"{s:.3f}", "-t", f"{max(0.1, e - s):.3f}",
+                        "-i", str(path), "-vn", "-af", "volumedetect", "-f", "null", "-"],
+                       capture_output=True, text=True, timeout=120)
+    m = re.search(r"mean_volume:\s*(-?[\d.]+) dB", r.stderr or "")
+    return float(m.group(1)) if m else -91.0
 
 
 def audio_mean_db(path: Path) -> float:
@@ -490,6 +620,7 @@ def qc(path: Path, work: Path, target: float, layout: dict) -> dict:
     run(["ffmpeg", "-y", "-v", "error", "-i", path, "-vf", "fps=2", "-q:v", "3", qdir / "%04d.jpg"])
     frames = sorted(qdir.glob("*.jpg"))
     fails, bg_means = [], []
+    text_ok = None
     y0, y1 = layout["act_y"], layout["act_y"] + layout["act_h"]  # real picture inside the plate
     x0, x1 = layout["plate_x"], layout["plate_x"] + layout["fg_w"]
     for i, fp in enumerate(frames):
@@ -503,16 +634,26 @@ def qc(path: Path, work: Path, target: float, layout: dict) -> dict:
         d = score_frame(im[y0:y1, x0:x1, :], None)
         if d["reject"]:
             fails.append((i / 2, "content", ", ".join(d["reasons"])))
+        elif text_ok is not False:
+            try:
+                txt = logo.text_boxes(im[y0:y1, x0:x1, :])
+                if txt:
+                    fails.append((i / 2, "content", f"text '{' / '.join(txt)[:40]}'"))
+            except Exception:
+                text_ok = False
         pe = layout["plate_y"] + layout["plate_h"]
         bg = np.concatenate([im[: max(layout["banner_y"] - 10, 1)], im[min(pe + 10, h - 1):]], axis=0)
         bg_means.append(float(luma(bg.astype(np.float32)).mean()))
     bg_mean = float(np.mean(bg_means)) if bg_means else 0.0
     bg_ok = bg_mean >= 22.0
+    lg = logo.check_output(path, (layout["plate_x"], layout["plate_y"], layout["fg_w"], layout["plate_h"]), log=log)
+    if lg["logo"]:
+        fails.append((-1, "logo", f"static overlay in plate corners {lg['counts']}"))
     return {
         "tech_ok": tech_ok, "width": st.get("width"), "height": st.get("height"),
         "pix_fmt": st.get("pix_fmt"), "fps": fps, "duration": dur, "has_audio": has_audio,
         "audio_mean_db": adb, "frames_checked": len(frames), "fails": fails,
-        "bg_mean_luma": bg_mean, "bg_ok": bg_ok,
+        "bg_mean_luma": bg_mean, "bg_ok": bg_ok, "logo": lg,
         "pass": bool(tech_ok and not fails and bg_ok), "target": target,
     }
 
@@ -525,6 +666,13 @@ def print_qc(r: dict):
     log(f"  audio      : {'yes' if r['has_audio'] else 'NO'}  mean {r['audio_mean_db']:.1f} dB")
     log(f"  background : mean luma {r['bg_mean_luma']:.1f} ({'ok' if r['bg_ok'] else 'TOO DARK'})")
     log(f"  frames     : {r['frames_checked']} checked at 2 fps, {len(r['fails'])} failed")
+    if r.get("dialogue"):
+        d = r["dialogue"]
+        log(f"  dialogue   : {d['lines']} line(s), {d['speech_s']:.1f}s speech | dialogue {d.get('dialogue_db', -120):.1f} dB "
+            f"vs ducked music {d.get('music_db', -120):.1f} dB ({d.get('margin_db', 0):+.1f} dB) "
+            f"| per line {d.get('per_line_margin_db', [])} dB "
+            f"| final file speech {d.get('final_speech_db', -91):.1f} dB / music-only {d.get('final_music_db', -91):.1f} dB"
+            f" -> {'ok' if d['ok'] else 'TOO QUIET'}")
     for t, kind, why in r["fails"][:10]:
         log(f"    t={t}s [{kind}] {why}")
     log(f"  result     : {'PASS' if r['pass'] else 'FAIL'}")
@@ -545,24 +693,42 @@ def plan_timing(bpm: float, cut_s: float, target_s: float) -> tuple[float, int, 
 
 def render_one(source: Path, music: Path, hook: str, out_path: Path, work: Path,
                cut_s: float, target_s: float, bpm_override: float | None, clips_override: int | None,
-               bg_brightness: float | None = None) -> dict:
+               bg_brightness: float | None = None, duck: float = DUCK) -> dict:
     """One source + one track, with up to QC_ROUNDS blacklist re-renders."""
     work.mkdir(parents=True, exist_ok=True)
     info = probe_video(source)
     layout = layout_for(info["w"], info["h"], detect_active(source, info["dur"], info["w"], info["h"]))
     head = float(math.floor(min(MAX_SKIP_HEAD, info["dur"] * 0.06)))
-    tail = min(MAX_SKIP_TAIL, info["dur"] * 0.10)
+    tail = min(MAX_SKIP_TAIL, info["dur"] * 0.14)
     usable_end = info["dur"] - tail
     if usable_end - head < 30:
         raise SourceError(f"source too short after trim: {info['dur']:.1f}s")
+
+    # 1. branding: reject sources with a persistent logo / channel bug, skip seconds with a temporary one
+    lg = logo.analyse_source(source, info["dur"], head, usable_end, log=log)
+    if lg["persistent"]:
+        raise SourceError(f"persistent logo / channel bug ({lg['persistent']}) - no clean footage")
+
+    # 2. music: tempo + section
     meta = load_music_meta(music) or {}
-    bpm = bpm_override or float(meta.get("bpm") or DEFAULT_BPM)
-    clip_dur, n_clips, beats = plan_timing(bpm, cut_s, target_s)
+    try:
+        song = audio_mix.decode(music, start=0, dur=420)
+    except audio_mix.AudioError as e:
+        raise RenderError(str(e))
+    if len(song) < audio_mix.SR * 30 or audio_mix.rms_db(song) < -50:
+        raise RenderError(f"music unusable (len {len(song) / audio_mix.SR:.0f}s, {audio_mix.rms_db(song):.0f} dB)")
+    bpm = bpm_override or (float(meta["bpm"]) if meta.get("bpm") else None)
+    if not bpm:
+        try:
+            mid = len(song) // 2
+            bpm = audio_mix.estimate_bpm(song[max(0, mid - audio_mix.SR * 30): mid + audio_mix.SR * 30])
+        except audio_mix.AudioError:
+            bpm = DEFAULT_BPM
+    clip_dur, n_units, beats = plan_timing(bpm, cut_s, target_s)
     if clips_override:
-        n_clips = clips_override
-    mdur = probe_duration(music)
+        n_units = clips_override
     log(f"Source {source.name} {info['w']}x{info['h']} {info['dur']:.1f}s | music {music.name} "
-        f"bpm={bpm} {beats} beats/cut clip={clip_dur:.3f}s x{n_clips}")
+        f"bpm={bpm} {beats} beats/cut unit={clip_dur:.3f}s x{n_units}")
     log(f"Layout plate {layout['fg_w']}x{layout['fg_h']} @ ({layout['plate_x']},{layout['plate_y']}) "
         f"banner @ Y={layout['banner_y']} (no crop, no captions, no watermark); "
         f"active picture rows {layout['act_src_y']}+{layout['act_src_h']} of {info['h']}")
@@ -572,54 +738,131 @@ def render_one(source: Path, music: Path, hook: str, out_path: Path, work: Path,
     frames_dir = work / "frames"
     extract_frames(source, frames_dir, head, usable_end - head, layout)
     rows = score_all(frames_dir, head)
+    try:  # credit names / title & brand cards (OCR); skipped if the OCR model is unavailable
+        text_secs = logo.text_seconds(sorted(frames_dir.glob("*.jpg")), head, log=log)
+    except Exception as e:
+        log(f"  text check unavailable ({e.__class__.__name__}: {str(e)[:80]}) - relying on logo/text-card checks")
+        text_secs = {}
+    for r in rows:
+        sec = int(round(r["t"]))
+        if sec in lg["bad_seconds"] or sec in text_secs:
+            r["reject"], r["spectacle"] = True, -1.0
+            r["reasons"] = r["reasons"] + (["logo"] if sec in lg["bad_seconds"] else [f"text '{text_secs[sec]}'"])
     if bg_brightness is None:
         src_mean = float(np.mean([r["mean"] for r in rows])) if rows else 80.0
         bg_brightness = -0.08 if src_mean > 90 else (0.0 if src_mean > 60 else 0.08)
-    drop = find_drop(decode_wav(music, work / "music.wav"))
 
-    # Self-heal: shrink clip count if the source has too few clean windows.
+    # 3. original dialogue
+    speech, vad = audio_mix.detect_speech(source, log=log)
+    try:
+        src_audio = audio_mix.decode(source)
+    except audio_mix.AudioError:
+        src_audio = np.zeros((0, 2), np.float32)
+
+    # self-heal: fewer units if the source has too few clean windows
     edl = None
-    for n in range(n_clips, 0, -1):
+    for n in range(n_units, 0, -1):
         if n * clip_dur < MIN_LEN:
             break
         try:
-            edl = pick_edl(rows, head, usable_end, clip_dur, n)
-            n_clips = n
+            edl = build_edl(rows, speech, src_audio, head, usable_end, clip_dur, n)
+            n_units = n
             break
         except SourceError as e:
-            log(f"  {e}; trying fewer clips")
+            log(f"  {e}; trying fewer cuts")
     if edl is None:
-        raise SourceError("not enough clean footage for a 20s+ video")
-    target = n_clips * clip_dur
-    reveal_t = edl[min(REVEAL_INDEX, n_clips - 1)]["t0"]
-    music_start = max(0.0, min(drop - reveal_t, mdur - target - 0.5))
+        raise SourceError("not enough clean (logo-free) footage for a 20s+ video")
+    target = n_units * clip_dur
+
+    if meta.get("source") == "YouTube":  # real song: start at its loudest sustained part (chorus/drop)
+        music_start = audio_mix.best_section(song, target)
+    else:
+        drop = find_drop(decode_wav(music, work / "music.wav"))
+        reveal_t = next(c["t0"] for c in edl if c["reveal"])
+        music_start = max(0.0, drop - reveal_t)
+    music_start = max(0.0, min(music_start, len(song) / audio_mix.SR - target - 0.5))
+
     raw = work / "raw_concat.mp4"
+    mix_wav = work / "mix.wav"
     blacklist: set[int] = set()
     report = None
     for rnd in range(1, QC_ROUNDS + 1):
-        log(f"Render round {rnd}: {n_clips} clips, {target:.2f}s, bg_brightness={bg_brightness:+.2f}")
+        dl = [c for c in edl if c.get("dialogue")]
+        log(f"Render round {rnd}: {len(edl)} cuts ({len(dl)} dialogue), {target:.2f}s, "
+            f"bg_brightness={bg_brightness:+.2f}, music from {music_start:.1f}s")
+        for c in dl:
+            log(f"  dialogue cut src {c['src_start']:.2f}-{c['src_end']:.2f} line {c['line']} "
+                f"clarity {c['clarity_db']} dB -> video {c['t0']:.2f}-{c['t1']:.2f}")
         render_raw(source, edl, raw, target)
-        render_final(raw, music, banner_png, music_start, target, out_path, layout, bg_brightness)
+        a0 = int(music_start * audio_mix.SR)
+        mix, speech_out, mstats = audio_mix.build_mix(src_audio, edl, song[a0:a0 + int((target + 1) * audio_mix.SR)],
+                                                      target, duck=duck)
+        audio_mix.write_wav(mix_wav, mix)
+        render_final(raw, mix_wav, banner_png, target, out_path, layout, bg_brightness)
         report = qc(out_path, work, target, layout)
+        # A single dark frame right at a cut is the source's own cut-to-black transition
+        # (~0.2s); it is not a bad shot, so it does not fail QC.
+        bounds = [c["t0"] for c in edl[1:]] + [target]
+        ftimes = {t for t, k, _ in report["fails"] if k == "content"}
+        keep, trans = [], []
+        for f in report["fails"]:
+            t, k = f[0], f[1]
+            isolated = (t - 0.5 not in ftimes) and (t + 0.5 not in ftimes)
+            if k == "content" and isolated and min(abs(t - b) for b in bounds) <= 0.35:
+                trans.append(f)
+            else:
+                keep.append(f)
+        if trans:
+            log(f"  ignoring {len(trans)} single cut-transition frame(s): {[t for t, _, _ in trans]}")
+        report["fails"], report["transition_frames"] = keep, trans
+        report["pass"] = bool(report["tech_ok"] and not keep and report["bg_ok"])
+        # dialogue audibility check (mix stats + measured on the final file)
+        dq = {"lines": len(dl), "speech_s": sum(e - s for s, e in speech_out), "vad": vad, "ok": True}
+        if speech_out:
+            dq["dialogue_db"] = mstats.get("dialogue_db_in_speech", -120)
+            dq["music_db"] = mstats.get("music_db_in_speech", -120)
+            dq["margin_db"] = dq["dialogue_db"] - dq["music_db"]
+            sp = [segment_db(out_path, s, e) for s, e in speech_out]
+            gaps = [(c["t0"], c["t1"]) for c in edl if not c.get("dialogue")][:4]
+            mu = [segment_db(out_path, s, e) for s, e in gaps]
+            dq["final_speech_db"] = float(np.mean(sp)) if sp else -91.0
+            dq["final_music_db"] = float(np.mean(mu)) if mu else -91.0
+            dq["per_line_margin_db"] = mstats.get("per_line_margin_db", [])
+            worst = min(dq["per_line_margin_db"]) if dq["per_line_margin_db"] else dq["margin_db"]
+            dq["ok"] = (dq["margin_db"] >= MIN_DIALOGUE_OVER_MUSIC_DB and worst >= 4.0
+                        and dq["final_speech_db"] > -35)
+            if not dq["ok"]:
+                report["fails"].append((-1, "dialogue", f"dialogue only {dq['margin_db']:+.1f} dB over music"))
+                report["pass"] = False
+        report["dialogue"] = dq
         print_qc(report)
         if report["pass"]:
             break
         if not report["tech_ok"]:
             raise RenderError(f"technical QC failed (audio {report['audio_mean_db']:.1f} dB, "
                               f"dur {report['duration']:.1f}s)")
+        kinds = {k for _, k, _ in report["fails"]}
+        if "logo" in kinds:
+            raise SourceError("logo / channel bug visible in output")
+        if "dialogue" in kinds:
+            duck = max(0.12, duck * 0.6)
+            log(f"  dialogue too quiet -> duck music harder ({duck:.2f})")
         if not report["bg_ok"]:
             bg_brightness = min(bg_brightness + 0.10, 0.25)
         for t, kind, _ in report["fails"]:
-            ci = min(int(t / clip_dur), len(edl) - 1)
-            src_t = edl[ci]["src_start"] + (t - edl[ci]["t0"])
+            if kind != "content":
+                continue
+            c = next((c for c in edl if c["t0"] <= t < c["t1"]), edl[-1])
+            src_t = c["src_start"] + (t - c["t0"])
             blacklist.update({math.floor(src_t - 0.5), math.floor(src_t), math.floor(src_t + 0.5)})
-        if report["fails"]:
+        if any(k == "content" for _, k, _ in report["fails"]):
             log(f"  blacklisting source seconds {sorted(blacklist)}")
-            edl = pick_edl(rows, head, usable_end, clip_dur, n_clips, blacklist)
+            edl = build_edl(rows, speech, src_audio, head, usable_end, clip_dur, n_units, blacklist)
     if not report or not report["pass"]:
         raise SourceError(f"QC still failing after {QC_ROUNDS} rounds")
-    report.update(edl=edl, music_start=music_start, drop=drop, bg_brightness=bg_brightness,
-                  layout=layout, clip_dur=clip_dur, clips=n_clips, bpm=bpm)
+    report.update(edl=edl, music_start=music_start, bg_brightness=bg_brightness, duck=duck,
+                  layout=layout, clip_dur=clip_dur, units=n_units, bpm=bpm, logo_source=lg["counts"],
+                  mix=mstats)
     return report
 
 
@@ -654,14 +897,22 @@ def parse_args(argv=None):
     p.add_argument("--max-sources", type=int, default=4, help="--auto: how many search results to try")
     p.add_argument("--exclude-id", action="append", default=[], help="--auto: skip this YouTube id")
     p.add_argument("--list-sources", action="store_true", help="--auto: only print ranked candidates, no render")
+    p.add_argument("--source-url", action="append", default=[],
+                   help="YouTube URL/id to use as source (repeatable, tried before search results)")
+    p.add_argument("--source-offset", type=int, default=0, help="--auto: skip the first N ranked sources (batch runs)")
+    p.add_argument("--no-song-search", action="store_true", help="use only local tracks from assets/music.json")
+    p.add_argument("--song-offset", type=int, default=0, help="skip the first N ranked songs (batch runs)")
+    p.add_argument("--duck", type=float, default=DUCK, help="music gain while characters speak (default 0.25)")
     a = p.parse_args(argv)
     if a.category:
         try:
             categories.get(a.category)
         except KeyError as e:
             p.error(str(e).strip('"'))
+    if a.source_url and a.category:
+        a.auto = True
     if not a.source and not a.auto:
-        p.error("give --source, or --auto with --category")
+        p.error("give --source, --source-url, or --auto with --category")
     if a.auto and not a.category:
         p.error("--auto needs --category")
     if not a.out and not a.list_sources:
@@ -669,12 +920,34 @@ def parse_args(argv=None):
     return a
 
 
+def finish(out_path: Path, work: Path, preset: dict | None, result) -> int:
+    music, hook, src_info, report, attempts = result
+    write_caption_txt(out_path, music, hook, preset, src_info)
+    meta = load_music_meta(music) or {}
+    summary = {"output": str(out_path), "category": preset["name"] if preset else None,
+               "hook": hook, "source": src_info, "music": music.name,
+               "song": {"title": meta.get("title"), "artist": meta.get("artist"),
+                        "url": meta.get("url") or meta.get("source_page")},
+               "music_credit": meta.get("credit", music.name),
+               "dialogue": report.get("dialogue"),
+               "duration": report["duration"], "qc_pass": report["pass"],
+               "attempts_before_success": attempts}
+    out_path.with_name(out_path.stem + ".json").write_text(json.dumps(summary, indent=2, ensure_ascii=False))
+    (work / "qc_report.json").write_text(json.dumps(report, indent=2, default=str))
+    log(f"OUTPUT {out_path} dur={report['duration']:.2f}s QC=PASS after {len(attempts)} failed attempt(s)")
+    return 0
+
+
 def main(argv=None) -> int:
     args = parse_args(argv)
     if args.list_sources:
         preset = categories.get(args.category)
-        for c in sourcing.candidates(preset, exclude=set(args.exclude_id), limit=args.max_sources, log=lambda m: None):
+        for c in sourcing.candidates(preset, exclude=set(args.exclude_id), limit=args.max_sources,
+                                     log=lambda m: None, offset=args.source_offset):
             print(f"{c['id']}  {c.get('duration')}s  {c.get('channel')}  {c.get('title')}")
+        print("songs:")
+        for c in sourcing.song_candidates(preset, log=lambda m: None):
+            print(f"{c['id']}  {c.get('duration')}s  {c.get('view_count')} views  {c.get('channel')}  {c.get('title')}")
         return 0
     out_path = args.out.expanduser()
     out_path = (Path.cwd() / out_path).resolve() if not out_path.is_absolute() else out_path
@@ -690,8 +963,22 @@ def main(argv=None) -> int:
     target_s = preset["target_s"] if preset else DEFAULT_TARGET_S
 
     track_list = [args.music] if args.music else []
+    if preset and not args.music and not args.no_song_search:
+        log("Searching popular songs for the category…")
+        songs = sourcing.song_candidates(preset, limit=3 + args.song_offset, log=log)[args.song_offset:]
+        for sg in songs:
+            log(f"  song {sg['id']} {sg.get('duration')}s {sg.get('view_count')} views {sg.get('channel')}: {sg.get('title')}")
+        if not songs:
+            log("  no song found online -> local fallback tracks")
+        track_list += songs
     track_list += (preset["music"] if preset else [DEFAULT_TRACK]) + categories.FALLBACK_MUSIC
-    track_list = list(dict.fromkeys(track_list))
+    seen_t, uniq = set(), []
+    for t in track_list:
+        key = track_label(t)
+        if key not in seen_t:
+            seen_t.add(key)
+            uniq.append(t)
+    track_list = uniq
 
     # Source candidates: (info, getter(height) -> Path)
     if args.source and not args.auto:
@@ -702,7 +989,25 @@ def main(argv=None) -> int:
         sources = [({"title": src.stem, "url": "", "id": src.stem}, None, src)]
     else:
         log(f"Searching official sources for category '{preset['name']}'…")
-        cands = sourcing.candidates(preset, exclude=set(args.exclude_id), limit=args.max_sources, log=log)
+        cands = []
+        for u in args.source_url:
+            e = sourcing.entry_from_id(u, log=log)
+            if e:
+                cands.append(e)
+        cands += sourcing.candidates(preset, exclude=set(args.exclude_id), limit=args.max_sources, log=log,
+                                     offset=args.source_offset)
+        uniq_c, seen_c = [], set()
+        for c in cands:
+            if c["id"] not in seen_c:
+                seen_c.add(c["id"])
+                uniq_c.append(c)
+        cands = uniq_c
+        have = seen_c | set(args.exclude_id)
+        for sid in preset.get("seeds") or []:  # self-heal: known official uploads after search results
+            if sid not in have:
+                e = sourcing.entry_from_id(sid, log=log)
+                if e and not sourcing.is_streaming(e):
+                    cands.append(e)
         if not cands:
             log("ERROR: no acceptable search results (network/yt-dlp?)")
             return 3
@@ -712,7 +1017,9 @@ def main(argv=None) -> int:
 
     attempts = []
     src_dir = ROOT / "work" / "sources"
-    for info, entry, local in sources:
+    want_dialogue = bool(preset.get("want_dialogue", True)) if preset else False
+    fallback, fallback_path = None, out_path.with_name(out_path.stem + ".fallback.mp4")
+    for si, (info, entry, local) in enumerate(sources):
         heights = [None] if local else [1080, 720, 480]
         for height in heights:
             label = f"{info.get('id')}@{height or 'local'}"
@@ -728,12 +1035,12 @@ def main(argv=None) -> int:
             render_failed = False
             hook = choose_hook(args, preset, out_path.stem, info.get("title") or "")
             for track in track_list:
-                tag = f"{label} + {Path(track).name}"
+                tag = f"{label} + {track_label(track)}"
                 try:
                     music = ensure_track(track)
                     log(f"\n--- attempt: {tag} ---")
                     report = render_one(path, music, hook, out_path, work, cut_s, target_s,
-                                        args.bpm, args.clips)
+                                        args.bpm, args.clips, duck=args.duck)
                 except SourceError as e:
                     log(f"  SOURCE problem ({tag}): {e} -> next source")
                     attempts.append(f"{tag}: {e}")
@@ -751,24 +1058,25 @@ def main(argv=None) -> int:
                 src_info = {"title": info.get("title"), "id": info.get("id"),
                             "channel": info.get("channel"),
                             "url": f"https://www.youtube.com/watch?v={info['id']}" if entry else ""}
-                write_caption_txt(out_path, music, hook, preset, src_info)
-                meta = load_music_meta(music) or {}
-                summary = {"output": str(out_path), "category": preset["name"] if preset else None,
-                           "hook": hook, "source": src_info, "music": music.name,
-                           "music_credit": meta.get("credit", music.name),
-                           "duration": report["duration"], "qc_pass": report["pass"],
-                           "attempts_before_success": attempts}
-                out_path.with_name(out_path.stem + ".json").write_text(
-                    json.dumps(summary, indent=2, ensure_ascii=False))
-                (work / "qc_report.json").write_text(json.dumps(report, indent=2, default=str))
-                log(f"OUTPUT {out_path} dur={report['duration']:.2f}s QC=PASS "
-                    f"after {len(attempts)} failed attempt(s)")
-                return 0
+                result = (music, hook, src_info, report, list(attempts))
+                no_dialogue = not (report.get("dialogue") or {}).get("lines")
+                if want_dialogue and no_dialogue and fallback is None and si < len(sources) - 1:
+                    # self-heal: keep this one as a fallback, look for a source with audible dialogue
+                    shutil.copy2(out_path, fallback_path)
+                    fallback = result
+                    log("  no dialogue line in this source -> kept as fallback, trying next source for dialogue")
+                    attempts.append(f"{tag}: rendered but no dialogue (kept as fallback)")
+                    break
+                return finish(out_path, work, preset, result)
             else:
                 if not render_failed:
                     break
                 continue  # every track failed to render: re-download lower resolution
             break  # SourceError: go to next source
+    if fallback is not None:
+        log("No source with dialogue passed; using the kept fallback render (music only).")
+        shutil.move(fallback_path, out_path)
+        return finish(out_path, work, preset, fallback)
     log("\nERROR: all fallbacks exhausted. Attempts:")
     for a in attempts:
         log(f"  - {a}")

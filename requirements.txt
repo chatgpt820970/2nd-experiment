@@ -1,3 +1,6 @@
 numpy>=1.26
 Pillow>=10.0
-yt-dlp>=2025.1.1
+yt-dlp[default]>=2025.11.12
+faster-whisper>=1.0   # Silero VAD (ONNX) for dialogue detection
+webrtcvad-wheels>=2.0.14   # fallback VAD
+rapidocr-onnxruntime>=1.2   # on-screen credit/title text detection
