@@ -1,1 +1,5 @@
-{"category": "bollywood,south,cricket,devotional", "count": 1, "note": "edit and commit this file to start a new render"}
+{
+  "category": "bollywood,south,cricket,devotional",
+  "count": 1,
+  "note": "retry after seed metadata null-guard"
+}

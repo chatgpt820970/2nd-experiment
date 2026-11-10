@@ -67,6 +67,9 @@ def search(query: str, n: int = 15, log=print) -> list[dict]:
         try:
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
             data = json.loads(r.stdout or "{}")
+            if not isinstance(data, dict):
+                log(f"  search '{query}' returned invalid payload (try {attempt})")
+                continue
             entries = [e for e in data.get("entries") or [] if e and e.get("id")]
             if entries:
                 return entries
@@ -250,7 +253,7 @@ def entry_from_id(vid_or_url: str, log=print) -> dict | None:
             d = json.loads(r.stdout or "{}")
         except (subprocess.TimeoutExpired, json.JSONDecodeError):
             continue
-        if d.get("id"):
+        if isinstance(d, dict) and d.get("id"):
             return {"id": d["id"], "title": d.get("title"), "channel": d.get("channel"),
                     "duration": d.get("duration"), "channel_is_verified": d.get("channel_is_verified"),
                     "view_count": d.get("view_count"), "url": url}
