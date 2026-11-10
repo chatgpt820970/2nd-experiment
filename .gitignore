@@ -1,0 +1,16 @@
+# Render outputs and scratch (never commit videos or music)
+out/
+work/
+assets/music/
+*.mp4
+*.mp3
+*.wav
+*.jpg
+*.png
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.DS_Store
