@@ -21,12 +21,17 @@ on:
         description: "Optional banner hook (use \\n for line 2). Empty = preset hook"
         required: false
         default: ""
+      attempt:
+        description: "Auto-retry counter (leave 0; the workflow increments this)"
+        required: false
+        default: "0"
   # Optional daily run at 09:00 IST (03:30 UTC). Uncomment to enable.
   # schedule:
   #   - cron: "30 3 * * *"
 
 permissions:
   contents: write
+  actions: write
 
 concurrency:
   group: render-${{ github.ref }}
@@ -37,6 +42,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.m.outputs.matrix }}
+      count: ${{ steps.m.outputs.count }}
     steps:
       - uses: actions/checkout@v4
       - id: m
@@ -68,13 +74,15 @@ jobs:
           include = [{"category": c, "index": i} for c in cats for i in range(n)]
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write("matrix=" + json.dumps({"include": include}) + "\n")
+              f.write(f"count={n}\n")
           print(json.dumps(include, indent=1))
           PY
 
   render:
     needs: plan
     runs-on: ubuntu-latest
-    timeout-minutes: 75
+    # Fail-fast: code skips blocked YouTube sources quickly; do not sit until 75 min.
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       max-parallel: 4
@@ -98,11 +106,32 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq ffmpeg fonts-noto-core fonts-dejavu-core
 
-      - name: Install Python deps
+      - name: Install Python deps, yt-dlp nightly, PO-token plugin
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install -U "yt-dlp[default]"   # newest extractor + EJS = fewest YouTube blocks
+          # Nightly/master extractors track YouTube changes faster than PyPI stable.
+          pip install -U --pre "yt-dlp[default]"
+          pip install -U "yt-dlp[default] @ https://github.com/yt-dlp/yt-dlp/archive/master.tar.gz"
+          pip install -U bgutil-ytdlp-pot-provider || echo "::warning::bgutil plugin install failed"
+          python -c "import yt_dlp; print('yt-dlp', yt_dlp.version.__version__)"
+
+      - name: Start bgutil PO-token provider
+        continue-on-error: true
+        run: |
+          docker run --name bgutil-provider -d --init --rm \
+            -p 127.0.0.1:4416:4416 brainicism/bgutil-ytdlp-pot-provider
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            if curl -sf http://127.0.0.1:4416/ >/dev/null 2>&1 \
+               || curl -sf http://127.0.0.1:4416/ping >/dev/null 2>&1 \
+               || docker logs bgutil-provider 2>&1 | grep -qiE 'listen|started|4416'; then
+              echo "bgutil provider is up"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::warning::bgutil provider did not become ready; continuing without it"
+          docker logs bgutil-provider || true
 
       - name: Fetch local fallback tracks
         continue-on-error: true
@@ -119,25 +148,20 @@ jobs:
                 --source-offset "$IDX" --song-offset "$IDX"
                 --out "out/${CAT}_${IDX}.mp4")
           if [ -n "$HOOK" ]; then args+=(--hook "$HOOK"); fi
-          # make_video.py already retries yt-dlp with other player clients, other
-          # sources, other songs and lower resolutions. If the whole run still
-          # fails (e.g. YouTube bot-blocks this runner IP), wait and retry.
-          for attempt in 1 2 3; do
-            if python make_video.py "${args[@]}"; then
-              echo "### ✅ ${CAT} #${IDX} rendered" >> "$GITHUB_STEP_SUMMARY"
-              python - <<'PY' >> "$GITHUB_STEP_SUMMARY" || true
+          # One attempt on this runner. Blocked YouTube IPs do not recover by
+          # sleeping and retrying here; a later workflow_dispatch uses a new IP.
+          if python make_video.py "${args[@]}"; then
+            echo "### ✅ ${CAT} #${IDX} rendered" >> "$GITHUB_STEP_SUMMARY"
+            python - <<'PY' >> "$GITHUB_STEP_SUMMARY" || true
           import json, glob
           for f in glob.glob("out/*.json"):
               d = json.load(open(f))
               print(f"- **{d['category']}**: {d['duration']:.1f}s | source: {d['source'].get('title')} {d['source'].get('url')} "
                     f"| song: {(d.get('song') or {}).get('title')} | dialogue lines: {(d.get('dialogue') or {}).get('lines')}")
           PY
-              exit 0
-            fi
-            echo "::warning::render attempt $attempt for ${CAT} #${IDX} failed; retrying in $((attempt * 90))s"
-            sleep $((attempt * 90))
-          done
-          echo "::error::All render attempts failed for ${CAT} #${IDX}. YouTube may be blocking yt-dlp on this runner; see the log artifact."
+            exit 0
+          fi
+          echo "::error::Render failed for ${CAT} #${IDX}. See the log artifact."
           exit 1
 
       - name: Upload video + caption + logs
@@ -156,6 +180,8 @@ jobs:
   # Publishes every rendered video as a public GitHub Release so they can be
   # downloaded without login. The run finishing (pass or fail) pings the bot via
   # its GitHub CI listener on main, and the bot sends the videos to BiBi.
+  # Succeeds when at least one mp4 exists; does not fail the whole run just
+  # because some categories failed.
   publish:
     needs: render
     if: always()
@@ -171,9 +197,53 @@ jobs:
         run: |
           ls -la dist || true
           shopt -s nullglob
+          mp4s=(dist/*.mp4)
+          if [ ${#mp4s[@]} -eq 0 ]; then
+            echo "::error::no videos to publish"
+            exit 1
+          fi
           files=(dist/*.mp4 dist/*.caption.txt dist/*.json)
-          if [ ${#files[@]} -eq 0 ]; then echo "::error::no videos to publish"; exit 1; fi
           tag="render-${{ github.run_id }}"
           gh release create "$tag" "${files[@]}" --repo "${{ github.repository }}" \
             --title "Render ${{ github.run_number }}" --notes "Videos from run ${{ github.run_id }}"
 
+  # If some category jobs failed, re-dispatch this workflow on a fresh runner
+  # (often a different IP) for only those categories. Max 2 automatic reruns.
+  retry:
+    needs: [plan, render]
+    if: always() && needs.render.result != 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Re-dispatch failed categories
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ATTEMPT: ${{ inputs.attempt || '0' }}
+          COUNT: ${{ needs.plan.outputs.count || '1' }}
+          HOOK: ${{ inputs.hook || '' }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          REF: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          ATTEMPT="${ATTEMPT:-0}"
+          if ! [[ "$ATTEMPT" =~ ^[0-9]+$ ]]; then ATTEMPT=0; fi
+          if [ "$ATTEMPT" -ge 2 ]; then
+            echo "Already completed $ATTEMPT auto-reruns; giving up."
+            echo "Already completed $ATTEMPT auto-reruns; giving up." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          FAILED=$(gh api "repos/${REPO}/actions/runs/${RUN_ID}/jobs" --paginate \
+            --jq '.jobs[] | select(.conclusion=="failure") | .name' \
+            | awk -F' #' '{print $1}' \
+            | grep -E '^(bollywood|south|hollywood|indian_celebrity|cricket|devotional|hindi_love|tv_serial|world_best)$' \
+            | sort -u | paste -sd, - || true)
+          if [ -z "$FAILED" ]; then
+            echo "No failed category jobs to retry."
+            exit 0
+          fi
+          NEXT=$((ATTEMPT + 1))
+          echo "Re-dispatching failed categories: $FAILED (attempt $NEXT)"
+          echo "Re-dispatching **$FAILED** (attempt $NEXT / 2)" >> "$GITHUB_STEP_SUMMARY"
+          args=(-f "category=${FAILED}" -f "count=${COUNT}" -f "attempt=${NEXT}")
+          if [ -n "$HOOK" ]; then args+=(-f "hook=${HOOK}"); fi
+          gh workflow run render.yml --repo "$REPO" --ref "$REF" "${args[@]}"
