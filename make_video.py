@@ -4,11 +4,16 @@
 No on-screen captions and no watermark. The full source frame is scaled
 to 1080 wide (no crop), placed under a tight white hook banner, and the
 banner+frame block is centered on a blurred 1080x1920 canvas. Beat-synced
-cuts on a royalty-free (NCS / Kevin MacLeod) track, then QC at 1 fps.
+cuts on a trending remix/mashup (never NCS or library music), then QC at 1 fps.
 
 v2: --category presets, --auto source fetching (yt-dlp), and a self-healing
 fallback loop (next source, re-download at lower resolution, next music
 track, repeated QC blacklisting, brighter background) with a run log.
+
+v5: songs come from SoundCloud / JioSaavn / Audiomack / archive.org / Dailymotion
+(YouTube song downloads are often blocked on runners). If no song can be
+fetched, the original source audio is used. NCS and Kevin MacLeod are never
+used. Logo-free time windows are preferred before a source is rejected.
 """
 from __future__ import annotations
 
@@ -57,7 +62,7 @@ DEFAULT_BPM = 129.0
 MIN_LEN, MAX_LEN = 20.0, 40.0
 REVEAL_INDEX = 5
 DEFAULT_HOOK = "Nobody was ready\nfor Fool Night"
-DEFAULT_TRACK = "ncs_lavida.mp3"
+SOURCE_AUDIO = "__source_audio__"
 
 CANVAS_W = 1080
 CANVAS_H = 1920
@@ -214,34 +219,53 @@ def load_music_meta(music: Path) -> dict | None:
     return None
 
 
+def is_source_audio(track) -> bool:
+    return track == SOURCE_AUDIO or track is None
+
+
 def track_label(track) -> str:
+    if is_source_audio(track):
+        return "original source audio"
     return f"song {track['id']}" if isinstance(track, dict) else Path(track).name
 
 
-def ensure_track(track) -> Path:
-    """Return a playable track path.
+def ensure_track(track):
+    """Return a playable track path, or SOURCE_AUDIO.
 
-    `track` is either a song search result (dict, downloaded with yt-dlp) or a
-    local file name/path from assets/music.json (downloaded from its URL if missing).
+    `track` is a song search result (dict, downloaded with yt-dlp), SOURCE_AUDIO
+    (use the clip's original audio), or a local file. NCS / library tracks are refused.
     """
+    if is_source_audio(track):
+        return SOURCE_AUDIO
     if isinstance(track, dict):
+        blob = " ".join(str(track.get(k) or "") for k in ("title", "channel", "url", "id"))
+        if categories.is_library_music(blob):
+            raise RenderError("refusing NCS / library song")
         try:
             path = sourcing.download_audio(track, SONG_DIR, log=log)
         except SourceError as e:
             raise RenderError(f"song download failed: {e}")
         title = track.get("title") or track["id"]
         artist = track.get("channel") or "unknown"
+        src_name = track.get("extractor") or ("YouTube" if sourcing.is_youtube(track) else "web")
+        url = track.get("url") or ""
+        if not url.startswith("http") and sourcing.is_youtube(track):
+            url = f"https://www.youtube.com/watch?v={track['id']}"
         path.with_suffix(".json").write_text(json.dumps({
-            "file": path.name, "title": title, "artist": artist, "source": "YouTube",
-            "url": f"https://www.youtube.com/watch?v={track['id']}",
+            "file": path.name, "title": title, "artist": artist, "source": src_name,
+            "url": url,
             "credit": f"Song: {title}\nArtist / label: {artist}",
             "bpm": None,
         }, indent=2, ensure_ascii=False))
         return path
     p = Path(track).expanduser()
+    if categories.is_library_music(p.name):
+        raise RenderError(f"refusing NCS / library track: {p.name}")
     if p.exists() and p.stat().st_size > 100_000:
         return p.resolve()
     meta = next((t for t in music_tracks() if t["file"] == p.name), None)
+    if meta and categories.is_library_music(" ".join(str(meta.get(k, "")) for k in ("file", "title", "artist", "source", "credit"))):
+        raise RenderError(f"refusing NCS / library track: {p.name}")
     dest = MUSIC_DIR / p.name
     if dest.exists() and dest.stat().st_size > 100_000:
         return dest
@@ -532,9 +556,14 @@ def make_banner(hook: str, banner_png: Path):
     log(f"Banner written font={font_path.name} {size}px lines={len(lines)}")
 
 
-def write_caption_txt(out_path: Path, music: Path, hook: str, preset: dict | None, src_info: dict) -> Path:
-    meta = load_music_meta(music)
-    credit = meta["credit"] if meta else f"Music: {music.name}"
+def write_caption_txt(out_path: Path, music, hook: str, preset: dict | None, src_info: dict) -> Path:
+    if is_source_audio(music):
+        credit = "Audio: original source"
+    else:
+        meta = load_music_meta(music)
+        credit = meta["credit"] if meta else f"Song: {Path(music).name}"
+        if categories.is_library_music(credit) or categories.is_library_music(getattr(music, "name", str(music))):
+            credit = "Audio: original source"
     hook_line = hook.replace("\\n", " ").replace("\n", " ")
     tags = (preset or {}).get("tags", "#shorts #fyp #viralreels")
     src_line = ""
@@ -691,7 +720,7 @@ def plan_timing(bpm: float, cut_s: float, target_s: float) -> tuple[float, int, 
     return clip_dur, n, beats
 
 
-def render_one(source: Path, music: Path, hook: str, out_path: Path, work: Path,
+def render_one(source: Path, music, hook: str, out_path: Path, work: Path,
                cut_s: float, target_s: float, bpm_override: float | None, clips_override: int | None,
                bg_brightness: float | None = None, duck: float = DUCK) -> dict:
     """One source + one track, with up to QC_ROUNDS blacklist re-renders."""
@@ -704,30 +733,43 @@ def render_one(source: Path, music: Path, hook: str, out_path: Path, work: Path,
     if usable_end - head < 30:
         raise SourceError(f"source too short after trim: {info['dur']:.1f}s")
 
-    # 1. branding: reject sources with a persistent logo / channel bug, skip seconds with a temporary one
+    # 1. branding: prefer logo-free time windows; only reject if too little clean footage remains.
+    # Nothing is blurred, cropped or painted over.
     lg = logo.analyse_source(source, info["dur"], head, usable_end, log=log)
-    if lg["persistent"]:
-        raise SourceError(f"persistent logo / channel bug ({lg['persistent']}) - no clean footage")
+    span = logo.clean_span(head, usable_end, lg["bad_seconds"], min_span=30.0)
+    if span:
+        if (span[0], span[1]) != (head, usable_end):
+            log(f"  using logo-free window {span[0]:.1f}-{span[1]:.1f}s (skipped logo segments)")
+        head, usable_end = span
+    clean_s = logo.clean_second_count(head, usable_end, lg["bad_seconds"])
+    if clean_s < 30:
+        why = f"persistent {lg['persistent']}" if lg["persistent"] else "logo in too many seconds"
+        raise SourceError(f"too little logo-free footage ({clean_s}s, {why})")
 
-    # 2. music: tempo + section
-    meta = load_music_meta(music) or {}
-    try:
-        song = audio_mix.decode(music, start=0, dur=420)
-    except audio_mix.AudioError as e:
-        raise RenderError(str(e))
-    if len(song) < audio_mix.SR * 30 or audio_mix.rms_db(song) < -50:
-        raise RenderError(f"music unusable (len {len(song) / audio_mix.SR:.0f}s, {audio_mix.rms_db(song):.0f} dB)")
+    # 2. music: tempo + section (or original source audio if no song)
+    use_source_audio = is_source_audio(music)
+    meta = {} if use_source_audio else (load_music_meta(music) or {})
+    song = None
     bpm = bpm_override or (float(meta["bpm"]) if meta.get("bpm") else None)
-    if not bpm:
+    if not use_source_audio:
         try:
-            mid = len(song) // 2
-            bpm = audio_mix.estimate_bpm(song[max(0, mid - audio_mix.SR * 30): mid + audio_mix.SR * 30])
-        except audio_mix.AudioError:
-            bpm = DEFAULT_BPM
+            song = audio_mix.decode(music, start=0, dur=420)
+        except audio_mix.AudioError as e:
+            raise RenderError(str(e))
+        if len(song) < audio_mix.SR * 30 or audio_mix.rms_db(song) < -50:
+            raise RenderError(f"music unusable (len {len(song) / audio_mix.SR:.0f}s, {audio_mix.rms_db(song):.0f} dB)")
+        if not bpm:
+            try:
+                mid = len(song) // 2
+                bpm = audio_mix.estimate_bpm(song[max(0, mid - audio_mix.SR * 30): mid + audio_mix.SR * 30])
+            except audio_mix.AudioError:
+                bpm = DEFAULT_BPM
+    bpm = bpm or DEFAULT_BPM
     clip_dur, n_units, beats = plan_timing(bpm, cut_s, target_s)
     if clips_override:
         n_units = clips_override
-    log(f"Source {source.name} {info['w']}x{info['h']} {info['dur']:.1f}s | music {music.name} "
+    music_name = "original source audio" if use_source_audio else Path(music).name
+    log(f"Source {source.name} {info['w']}x{info['h']} {info['dur']:.1f}s | music {music_name} "
         f"bpm={bpm} {beats} beats/cut unit={clip_dur:.3f}s x{n_units}")
     log(f"Layout plate {layout['fg_w']}x{layout['fg_h']} @ ({layout['plate_x']},{layout['plate_y']}) "
         f"banner @ Y={layout['banner_y']} (no crop, no captions, no watermark); "
@@ -758,6 +800,16 @@ def render_one(source: Path, music: Path, hook: str, out_path: Path, work: Path,
         src_audio = audio_mix.decode(source)
     except audio_mix.AudioError:
         src_audio = np.zeros((0, 2), np.float32)
+    if use_source_audio and not bpm_override and src_audio.size:
+        try:
+            mid = len(src_audio) // 2
+            bpm = audio_mix.estimate_bpm(src_audio[max(0, mid - audio_mix.SR * 30): mid + audio_mix.SR * 30])
+            clip_dur, n_units, beats = plan_timing(bpm, cut_s, target_s)
+            if clips_override:
+                n_units = clips_override
+            log(f"  source-audio tempo {bpm} bpm, unit={clip_dur:.3f}s x{n_units}")
+        except audio_mix.AudioError:
+            pass
 
     # self-heal: fewer units if the source has too few clean windows
     edl = None
@@ -774,13 +826,11 @@ def render_one(source: Path, music: Path, hook: str, out_path: Path, work: Path,
         raise SourceError("not enough clean (logo-free) footage for a 20s+ video")
     target = n_units * clip_dur
 
-    if meta.get("source") == "YouTube":  # real song: start at its loudest sustained part (chorus/drop)
-        music_start = audio_mix.best_section(song, target)
+    if use_source_audio:
+        music_start = 0.0
     else:
-        drop = find_drop(decode_wav(music, work / "music.wav"))
-        reveal_t = next(c["t0"] for c in edl if c["reveal"])
-        music_start = max(0.0, drop - reveal_t)
-    music_start = max(0.0, min(music_start, len(song) / audio_mix.SR - target - 0.5))
+        music_start = audio_mix.best_section(song, target)
+        music_start = max(0.0, min(music_start, len(song) / audio_mix.SR - target - 0.5))
 
     raw = work / "raw_concat.mp4"
     mix_wav = work / "mix.wav"
@@ -794,9 +844,12 @@ def render_one(source: Path, music: Path, hook: str, out_path: Path, work: Path,
             log(f"  dialogue cut src {c['src_start']:.2f}-{c['src_end']:.2f} line {c['line']} "
                 f"clarity {c['clarity_db']} dB -> video {c['t0']:.2f}-{c['t1']:.2f}")
         render_raw(source, edl, raw, target)
-        a0 = int(music_start * audio_mix.SR)
-        mix, speech_out, mstats = audio_mix.build_mix(src_audio, edl, song[a0:a0 + int((target + 1) * audio_mix.SR)],
-                                                      target, duck=duck)
+        if use_source_audio:
+            mix, speech_out, mstats = audio_mix.build_source_only_mix(src_audio, edl, target)
+        else:
+            a0 = int(music_start * audio_mix.SR)
+            mix, speech_out, mstats = audio_mix.build_mix(src_audio, edl, song[a0:a0 + int((target + 1) * audio_mix.SR)],
+                                                          target, duck=duck)
         audio_mix.write_wav(mix_wav, mix)
         render_final(raw, mix_wav, banner_png, target, out_path, layout, bg_brightness)
         report = qc(out_path, work, target, layout)
@@ -829,8 +882,12 @@ def render_one(source: Path, music: Path, hook: str, out_path: Path, work: Path,
             dq["final_music_db"] = float(np.mean(mu)) if mu else -91.0
             dq["per_line_margin_db"] = mstats.get("per_line_margin_db", [])
             worst = min(dq["per_line_margin_db"]) if dq["per_line_margin_db"] else dq["margin_db"]
-            dq["ok"] = (dq["margin_db"] >= MIN_DIALOGUE_OVER_MUSIC_DB and worst >= 4.0
-                        and dq["final_speech_db"] > -35)
+            if use_source_audio:
+                # Original soundtrack already has dialogue mixed in; no added bed to duck.
+                dq["ok"] = dq["final_speech_db"] > -35
+            else:
+                dq["ok"] = (dq["margin_db"] >= MIN_DIALOGUE_OVER_MUSIC_DB and worst >= 4.0
+                            and dq["final_speech_db"] > -35)
             if not dq["ok"]:
                 report["fails"].append((-1, "dialogue", f"dialogue only {dq['margin_db']:+.1f} dB over music"))
                 report["pass"] = False
@@ -888,7 +945,7 @@ def parse_args(argv=None):
     p.add_argument("--auto", action="store_true", help="Fetch an official source for --category with yt-dlp")
     p.add_argument("--hook", default=None, help="Top banner hook, use \\n for a second line")
     p.add_argument("--hook-index", type=int, default=None, help="Pick preset hook N (default: by output name)")
-    p.add_argument("--music", default=None, help="Track file/path; default = category's track list")
+    p.add_argument("--music", default=None, help="Song file/path; default = searched remix, else original source audio")
     p.add_argument("--out", type=Path, help="Output mp4 path (required unless --list-sources)")
     p.add_argument("--bpm", type=float, default=None, help="Override music BPM")
     p.add_argument("--clips", type=int, default=None, help="Override number of cuts")
@@ -900,7 +957,7 @@ def parse_args(argv=None):
     p.add_argument("--source-url", action="append", default=[],
                    help="YouTube URL/id to use as source (repeatable, tried before search results)")
     p.add_argument("--source-offset", type=int, default=0, help="--auto: skip the first N ranked sources (batch runs)")
-    p.add_argument("--no-song-search", action="store_true", help="use only local tracks from assets/music.json")
+    p.add_argument("--no-song-search", action="store_true", help="do not search for a song; use original source audio")
     p.add_argument("--song-offset", type=int, default=0, help="skip the first N ranked songs (batch runs)")
     p.add_argument("--duck", type=float, default=DUCK, help="music gain while characters speak (default 0.25)")
     a = p.parse_args(argv)
@@ -923,12 +980,22 @@ def parse_args(argv=None):
 def finish(out_path: Path, work: Path, preset: dict | None, result) -> int:
     music, hook, src_info, report, attempts = result
     write_caption_txt(out_path, music, hook, preset, src_info)
-    meta = load_music_meta(music) or {}
+    if is_source_audio(music):
+        music_name = "original_source_audio"
+        song_info = {"title": "original source audio", "artist": None, "url": None}
+        music_credit = "Audio: original source"
+    else:
+        meta = load_music_meta(music) or {}
+        music_name = Path(music).name
+        song_info = {"title": meta.get("title"), "artist": meta.get("artist"),
+                     "url": meta.get("url") or meta.get("source_page")}
+        music_credit = meta.get("credit", music_name)
+        if categories.is_library_music(music_credit) or categories.is_library_music(music_name):
+            music_credit = "Audio: original source"
     summary = {"output": str(out_path), "category": preset["name"] if preset else None,
-               "hook": hook, "source": src_info, "music": music.name,
-               "song": {"title": meta.get("title"), "artist": meta.get("artist"),
-                        "url": meta.get("url") or meta.get("source_page")},
-               "music_credit": meta.get("credit", music.name),
+               "hook": hook, "source": src_info, "music": music_name,
+               "song": song_info,
+               "music_credit": music_credit,
                "dialogue": report.get("dialogue"),
                "duration": report["duration"], "qc_pass": report["pass"],
                "attempts_before_success": attempts}
@@ -964,14 +1031,19 @@ def main(argv=None) -> int:
 
     track_list = [args.music] if args.music else []
     if preset and not args.music and not args.no_song_search:
-        log("Searching popular songs for the category…")
-        songs = sourcing.song_candidates(preset, limit=3 + args.song_offset, log=log)[args.song_offset:]
+        log("Searching trending remix/mashup songs (no NCS / library music)…")
+        songs = sourcing.song_candidates(preset, limit=5 + args.song_offset, log=log)[args.song_offset:]
         for sg in songs:
             log(f"  song {sg['id']} {sg.get('duration')}s {sg.get('view_count')} views {sg.get('channel')}: {sg.get('title')}")
         if not songs:
-            log("  no song found online -> local fallback tracks")
+            log("  no song found online -> original source audio (no library fallback)")
         track_list += songs
-    track_list += (preset["music"] if preset else [DEFAULT_TRACK]) + categories.FALLBACK_MUSIC
+    # Never append NCS / Kevin MacLeod / generic library tracks.
+    track_list = [t for t in track_list if not (
+        (isinstance(t, dict) and categories.is_library_music(" ".join(str(t.get(k) or "") for k in ("title", "channel", "url"))))
+        or (not isinstance(t, dict) and not is_source_audio(t) and categories.is_library_music(str(t)))
+    )]
+    track_list.append(SOURCE_AUDIO)
     seen_t, uniq = set(), []
     for t in track_list:
         key = track_label(t)
@@ -1003,11 +1075,14 @@ def main(argv=None) -> int:
                 uniq_c.append(c)
         cands = uniq_c
         have = seen_c | set(args.exclude_id)
-        for sid in preset.get("seeds") or []:  # self-heal: known official uploads after search results
-            if sid not in have:
-                e = sourcing.entry_from_id(sid, log=log)
-                if e and not sourcing.is_streaming(e):
-                    cands.append(e)
+        if sourcing.youtube_is_blocked():
+            log("  skipping YouTube seed ids (downloads blocked on this IP)")
+        else:
+            for sid in preset.get("seeds") or []:  # self-heal: known official uploads after search results
+                if sid not in have:
+                    e = sourcing.entry_from_id(sid, log=log)
+                    if e and not sourcing.is_streaming(e):
+                        cands.append(e)
         if not cands:
             log("ERROR: no acceptable search results (network/yt-dlp?)")
             return 3

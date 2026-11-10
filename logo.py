@@ -1,7 +1,8 @@
 """Template-free static-overlay (logo / channel bug / scorebug) detector.
 
-Detection only: nothing is blurred, cropped or painted over. A source with a
-persistent overlay is rejected; seconds with a temporary overlay are skipped.
+Detection only: nothing is blurred, cropped or painted over. Seconds (and
+20s chunks) with an overlay are marked so cuts can be picked from logo-free
+windows. A source is only rejected when too little clean footage remains.
 
 Idea: real footage changes from shot to shot, an overlay does not. We mark
 pixels with a strong horizontal gradient (|dI/dx|) in each frame; pixels that
@@ -90,8 +91,20 @@ def analyse_source(path: Path, dur: float, head: float, usable_end: float, log=p
                 bad.add(int(head + k / 2.0))
     if persistent is None and total and flagged / total >= 0.5:
         persistent = "most windows"
+    # Chunk-level persistence: a logo only in the intro/outro must not kill the
+    # whole source — mark those 20s chunks as bad and keep clean windows.
+    chunk = 40  # 20 s at 2 fps
+    for i in range(0, len(e), chunk):
+        sl = e[i:i + chunk]
+        if len(sl) < WIN:
+            break
+        c, cen = corner_counts(sl.mean(0), PERSIST_FREQ)
+        if max(c.values()) >= PERSIST_PX and cen < PERSIST_PX:
+            for k in range(i, min(i + chunk, len(e))):
+                bad.add(int(head + k / 2.0))
     log(f"  logo check: corners {counts} center {center} | {flagged}/{total} windows flagged"
-        + (f" | PERSISTENT overlay ({persistent})" if persistent else ""))
+        + (f" | overlay ({persistent})" if persistent else "")
+        + f" | {len(bad)} logo second(s) skipped")
     return {"persistent": persistent, "bad_seconds": bad, "counts": counts}
 
 
@@ -105,6 +118,35 @@ def check_output(path: Path, plate: tuple[int, int, int, int], log=print) -> dic
     logo = max(counts.values()) >= 25 and center < 25
     log(f"  output logo check: corners {counts} center {center} -> {'LOGO' if logo else 'clean'}")
     return {"logo": bool(logo), "counts": counts}
+
+
+
+def clean_span(head: float, usable_end: float, bad_seconds, min_span: float = 30.0):
+    """Largest contiguous logo-free span of at least min_span seconds, or None."""
+    import math
+    start, end = int(math.floor(head)), int(math.ceil(usable_end))
+    bad = set(bad_seconds or ())
+    best = None  # (length, s, e)
+    s = start
+    while s < end:
+        if s in bad:
+            s += 1
+            continue
+        e = s
+        while e < end and e not in bad:
+            e += 1
+        length = e - s
+        if length >= min_span and (best is None or length > best[0]):
+            best = (length, float(max(head, s)), float(min(usable_end, e)))
+        s = e + 1
+    if not best:
+        return None
+    return best[1], best[2]
+
+
+def clean_second_count(head: float, usable_end: float, bad_seconds) -> int:
+    bad = set(bad_seconds or ())
+    return sum(1 for t in range(int(head), int(usable_end)) if t not in bad)
 
 
 # ---------------------------------------------------------------- on-screen text (credits / brand cards)

@@ -4,19 +4,22 @@ Each preset has:
   hooks      default top-banner hooks (Hinglish, Latin script; use \n for line 2)
   hook_match optional {title word: hook index} so the hook fits the fetched source
   queries    YouTube search queries for --auto, tried in order
+  alt_queries extra Dailymotion / archive.org queries (used when YouTube is blocked)
+  alt_limit  how many non-YouTube fallback clips to keep
   must_any   a result title must contain one of these words (official material)
   cut_s      target seconds per cut; beats-per-cut is derived from the track BPM
   target_s   target video length (20-40s); clip count is derived from it
   avoid      extra title words that disqualify a result (e.g. OTT series)
   prefer     title/channel words that rank a result higher
   verified_only / channels_only  optional stricter source rules
-  song_queries  yt-dlp searches for a popular / trending song (remix, mashup, bhajan remix...)
+  song_queries  searches for a trending remix / mashup / bhajan remix
   song_prefer   channel/title words that rank a song higher (music labels)
   seeds      known official YouTube ids tried after the search results
-  music      LOCAL fallback track files from assets/music.json if song download fails
   tags       hashtags for the post caption
 """
 from __future__ import annotations
+
+import re
 
 # Words that disqualify a search result for every category: non-official
 # material, static lyric/audio uploads, and anything sexual/suggestive.
@@ -44,8 +47,16 @@ STREAMING_CHANNELS = [
 # Song search: skip edits that sound bad or are not a single track.
 MUSIC_BLOCK_WORDS = [
     "slowed", "reverb", "8d", "lofi", "lo-fi", "karaoke", "ringtone", "status", "shorts", "#shorts",
-    "live", "jukebox", "nonstop", "non stop", "full album", "hour", "hours", "reaction", "sexy",
+    "live", "jukebox", "nonstop", "non stop", "non-stop", "full album", "hour", "hours", "reaction", "sexy",
     "hot", "nude", "bass boosted", "whatsapp",
+]
+
+# Never use these as the music bed (NCS, Kevin MacLeod, generic library music).
+LIBRARY_MUSIC_WORDS = [
+    "ncs", "nocopyrightsounds", "no copyright sounds", "no copyrights sounds",
+    "kevin macleod", "incompetech", "copyright free", "royalty free",
+    "audio library", "youtube audio library", "epidemic sound", "mixkit",
+    "pixabay", "bensound", "ncs release",
 ]
 
 MUSIC_LABELS = [
@@ -55,6 +66,20 @@ MUSIC_LABELS = [
 ]
 
 OFFICIAL_WORDS = ["official", "trailer", "teaser", "promo", "highlights", "glimpse", "song"]
+
+_LIBRARY_FILE_RE = re.compile(r"(^|[_\s./-])ncs([_\s./-]|$)|macleod|incompetech|nocopyrightsounds", re.I)
+_LIBRARY_WORD_RE = re.compile(
+    r"(?<![a-z0-9])(" + "|".join(re.escape(w) for w in LIBRARY_MUSIC_WORDS) + r")(?![a-z0-9])",
+    re.I,
+)
+
+
+def is_library_music(text: str) -> bool:
+    """True if a title, artist, filename or credit is NCS / Kevin MacLeod / library music."""
+    if not text:
+        return False
+    return bool(_LIBRARY_FILE_RE.search(text) or _LIBRARY_WORD_RE.search(text))
+
 
 CATEGORIES: dict[str, dict] = {
     "bollywood": {
@@ -76,11 +101,14 @@ CATEGORIES: dict[str, dict] = {
         "prefer": ["t-series", "yash raj", "dharma", "excel", "jio studios", "maddock", "zee studios"],
         "cut_s": 2.3,
         "target_s": 26,
-        "song_queries": ["bollywood remix mashup 2025", "bollywood party song remix official", "latest bollywood dance song official video"],
-        "song_prefer": MUSIC_LABELS,
-        # known official uploads tried after search results (search results change daily)
+        "song_queries": [
+            "hindi remix mashup 2025",
+            "punjabi remix mashup 2025",
+            "bollywood party remix mashup",
+            "latest punjabi dance remix",
+        ],
+        "song_prefer": MUSIC_LABELS + ["hindi", "punjabi", "bollywood", "desi"],
         "seeds": ["fneuVQ7uO_w", "vCTt_PnWHPg", "hpwnlr-ZHB0", "nCa4BGy3MJ8"],
-        "music": ["ncs_montagemindia.mp3", "ncs_tequilainmycup.mp3", "ncs_lavida.mp3"],
         "tags": "#bollywood #trailer #hindimovie #newmovie #fyp #viralreels",
     },
     "south": {
@@ -91,21 +119,47 @@ CATEGORIES: dict[str, dict] = {
             "Pan India\nblockbuster loading",
         ],
         "queries": [
-            "telugu movie official trailer hindi 2026",
+            "telugu movie official trailer 2026",
             "tamil movie official trailer 2026",
-            "pan india movie official teaser hindi",
-            "kannada malayalam movie official trailer 2026",
+            "kannada movie official trailer 2026",
+            "malayalam movie official trailer 2026",
+            "telugu official teaser 2026",
+            "tamil official teaser 2026",
+            "pan india movie official trailer",
+            "tollywood official trailer",
+            "kollywood official trailer",
+            "telugu movie official trailer hindi 2026",
         ],
+        "alt_queries": [
+            "telugu official trailer",
+            "tamil official trailer",
+            "kannada official trailer",
+            "malayalam official trailer",
+            "telugu movie official teaser",
+            "tamil movie official teaser",
+            "kannada movie official teaser",
+            "malayalam movie official teaser",
+            "tollywood official trailer",
+            "kollywood official trailer",
+            "south indian official trailer",
+            "telugu official glimpse",
+            "tamil official glimpse",
+            "pan india official trailer",
+        ],
+        "alt_limit": 16,
         "must_any": ["trailer", "teaser", "glimpse"],
         "avoid": SERIES_WORDS,
         "prefer": SOUTH_WORDS + ["pan india", "hombale", "mythri", "sun pictures", "lyca"],
         "cut_s": 2.2,
         "target_s": 26,
-        "song_queries": ["south indian mass song hindi official", "telugu mass song official video", "anirudh mass song official", "tamil kuthu song official video"],
-        "song_prefer": MUSIC_LABELS,
-        # known official uploads tried after search results (search results change daily)
+        "song_queries": [
+            "telugu remix mashup 2025",
+            "tamil kuthu remix mashup",
+            "telugu mass remix 2025",
+            "tamil remix mashup 2025",
+        ],
+        "song_prefer": MUSIC_LABELS + ["telugu", "tamil", "kuthu", "kollywood", "tollywood"],
         "seeds": ["ho4ACWs1hwc", "EaODp3C7wkU"],
-        "music": ["ncs_fellshortofhell.mp3", "ncs_godless.mp3", "km_Impact_Prelude.mp3"],
         "tags": "#southmovie #pushpa #tollywood #kollywood #massentry #fyp",
     },
     "hollywood": {
@@ -124,9 +178,12 @@ CATEGORIES: dict[str, dict] = {
         "avoid": SERIES_WORDS,
         "cut_s": 2.3,
         "target_s": 26,
-        "song_queries": ["trending english song 2025 official video", "epic english song official video", "imagine dragons official music video"],
+        "song_queries": [
+            "english song remix mashup 2025",
+            "trending english remix official",
+            "epic english song remix mashup",
+        ],
         "song_prefer": MUSIC_LABELS,
-        "music": ["ncs_godless.mp3", "km_Impact_Prelude.mp3", "ncs_adrenaline.mp3"],
         "tags": "#hollywood #trailer #newmovie #movies #fyp #viralreels",
     },
     "indian_celebrity": {
@@ -148,9 +205,12 @@ CATEGORIES: dict[str, dict] = {
         "prefer": ["shah rukh", "salman", "deepika", "alia", "prabhas", "ranbir", "amitabh"],
         "cut_s": 2.3,
         "target_s": 26,
-        "song_queries": ["trending bollywood song 2025 official", "bollywood superhit song remix", "punjabi trending song remix official"],
+        "song_queries": [
+            "hindi remix mashup 2025",
+            "punjabi remix mashup 2025",
+            "bollywood superhit remix mashup",
+        ],
         "song_prefer": MUSIC_LABELS,
-        "music": ["ncs_tequilainmycup.mp3", "ncs_lavida.mp3", "ncs_montagemindia.mp3"],
         "tags": "#bollywoodcelebrity #superstar #srk #bollywood #fyp #viralreels",
     },
     "cricket": {
@@ -174,11 +234,14 @@ CATEGORIES: dict[str, dict] = {
         "prefer": ["icc", "bcci", "star sports", "jiohotstar", "sony sports", "ipl"],
         "cut_s": 2.2,
         "target_s": 26,
-        "song_queries": ["cricket anthem official song", "team india cricket song official", "world cup anthem official song", "punjabi hype song official"],
-        "song_prefer": MUSIC_LABELS,
-        # known official uploads tried after search results (search results change daily)
+        "song_queries": [
+            "punjabi remix mashup 2025",
+            "hindi hype remix mashup",
+            "punjabi dance remix 2025",
+            "bollywood party remix mashup",
+        ],
+        "song_prefer": MUSIC_LABELS + ["punjabi", "hindi", "bollywood", "desi", "india"],
         "seeds": ["6L6XqWoS8tw", "BT0zd0kmTxM", "tsxemFX0a7k"],
-        "music": ["ncs_adrenaline.mp3", "ncs_lavida.mp3", "ncs_fellshortofhell.mp3"],
         "tags": "#cricket #teamindia #highlights #ipl #icc #fyp",
     },
     "devotional": {
@@ -205,11 +268,14 @@ CATEGORIES: dict[str, dict] = {
         "prefer": ["ramayana", "hanuman", "shiva", "mahadev", "krishna", "ram"],
         "cut_s": 2.7,
         "target_s": 27,
-        "song_queries": ["hanuman bhajan remix", "jai shri ram song dj remix", "mahadev song remix", "krishna bhajan remix"],
+        "song_queries": [
+            "hanuman bhajan remix",
+            "jai shri ram dj remix",
+            "mahadev bhajan remix",
+            "krishna bhajan remix",
+        ],
         "song_prefer": MUSIC_LABELS + ["bhakti", "hansraj", "lakhbir", "hanuman", "ram", "mahadev", "krishna"],
-        # known official uploads tried after search results (search results change daily)
         "seeds": ["1zip1rNaNYs", "T0Uduwg2W2w"],
-        "music": ["km_Intrepid.mp3", "ncs_flowersinmyhead.mp3", "km_Impact_Prelude.mp3"],
         "tags": "#jaishriram #harharmahadev #bhakti #devotional #sanatan #fyp",
     },
     "hindi_love": {
@@ -229,11 +295,13 @@ CATEGORIES: dict[str, dict] = {
         "avoid_extra": SOUTH_WORDS,
         "cut_s": 2.6,
         "target_s": 26,
-        "song_queries": ["romantic hindi song 2025 official video", "arijit singh romantic song official", "bollywood love mashup 2025"],
+        "song_queries": [
+            "romantic hindi remix mashup 2025",
+            "bollywood love mashup 2025",
+            "arijit singh romantic remix mashup",
+        ],
         "song_prefer": MUSIC_LABELS,
-        # known official uploads tried after search results (search results change daily)
         "seeds": ["rRQ8oKCoYrQ", "HdD6rU98yvg"],
-        "music": ["ncs_teamo.mp3", "ncs_fireflies.mp3", "km_Heartbreaking.mp3"],
         "tags": "#lovestory #pyaar #romantic #bollywood #couplegoals #fyp",
     },
     "tv_serial": {
@@ -257,9 +325,12 @@ CATEGORIES: dict[str, dict] = {
         "must_any": ["promo", "trailer", "teaser"],
         "cut_s": 2.4,
         "target_s": 24,
-        "song_queries": ["hindi serial title song official", "emotional hindi song official video", "sad hindi song official video"],
+        "song_queries": [
+            "emotional hindi remix mashup",
+            "sad hindi song remix mashup",
+            "romantic hindi remix mashup",
+        ],
         "song_prefer": MUSIC_LABELS,
-        "music": ["km_Heartbreaking.mp3", "ncs_teamo.mp3", "ncs_favela.mp3"],
         "tags": "#tvserial #starplus #serialtwist #drama #hinditv #fyp",
     },
     "world_best": {
@@ -280,15 +351,18 @@ CATEGORIES: dict[str, dict] = {
                    "netflix", "imax", "yrf", "t-series"],
         "cut_s": 2.2,
         "target_s": 26,
-        "song_queries": ["trending english song 2025 official video", "world famous song official video", "epic motivational song official"],
+        "song_queries": [
+            "english song remix mashup 2025",
+            "world famous song remix mashup",
+            "epic motivational remix mashup",
+        ],
         "song_prefer": MUSIC_LABELS,
-        "music": ["km_Impact_Prelude.mp3", "ncs_godless.mp3", "ncs_adrenaline.mp3"],
         "tags": "#worldbest #blockbuster #trailer #movies #cinema #fyp",
     },
 }
 
-# Generic last-resort tracks if every preset track fails.
-FALLBACK_MUSIC = ["ncs_lavida.mp3", "ncs_adrenaline.mp3", "km_Impact_Prelude.mp3"]
+# No library / NCS / Kevin MacLeod fallback. If song fetch fails, use original source audio.
+FALLBACK_MUSIC: list[str] = []
 
 
 def get(name: str) -> dict:

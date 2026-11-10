@@ -1,6 +1,7 @@
 """Find and download an official 16:9 source clip for a category (yt-dlp)."""
 from __future__ import annotations
 
+import html as _html
 import json
 import re
 import shutil
@@ -11,9 +12,13 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-from categories import BLOCK_WORDS, MUSIC_BLOCK_WORDS, OFFICIAL_WORDS, STREAMING_CHANNELS
+from categories import (
+    BLOCK_WORDS, MUSIC_BLOCK_WORDS, OFFICIAL_WORDS, STREAMING_CHANNELS,
+    is_library_music,
+)
 
 MIN_DUR = 60      # need enough footage for ~10 non-overlapping beat cuts
+MIN_DUR_ALT = 45  # teasers on fallback hosts are often 45-90s
 MAX_DUR = 600     # "under ~10 min"
 
 # Fail-fast limits so a GitHub job never sits on a blocked IP until the 75-min cap.
@@ -117,9 +122,15 @@ def is_streaming(e: dict) -> bool:
     return bool(_STREAMING.search(e.get("channel") or "") or _STREAMING.search(e.get("title") or ""))
 
 
+_NON_YT_HOSTS = (
+    "dailymotion.com", "archive.org", "vimeo.com", "soundcloud.com", "dai.ly",
+    "jiosaavn.com", "saavn.com", "audiomack.com", "bandcamp.com",
+)
+
+
 def is_youtube(e: dict) -> bool:
     url = (e.get("url") or e.get("webpage_url") or "").lower()
-    if any(s in url for s in ("dailymotion.com", "archive.org", "vimeo.com", "soundcloud.com", "dai.ly")):
+    if any(s in url for s in _NON_YT_HOSTS):
         return False
     if "youtube.com" in url or "youtu.be" in url:
         return True
@@ -129,6 +140,23 @@ def is_youtube(e: dict) -> bool:
 
 def _safe_id(vid: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", vid)[:80]
+
+
+def _http_json(url: str, log=print, timeout: int = 20, what: str = "request"):
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "Mozilla/5.0 (compatible; 2nd-experiment/5.0)",
+        "Accept": "application/json,text/plain,*/*",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+        raw = raw.lstrip()
+        if raw.startswith(")]}'"):
+            raw = raw[4:].lstrip()
+        return json.loads(raw or "{}")
+    except Exception as e:
+        log(f"    {what} failed: {e}")
+        return None
 
 
 def _entries_from_payload(data) -> list[dict]:
@@ -191,12 +219,13 @@ def search(query: str, n: int = 15, log=print, prefix: str | None = None) -> lis
 
 
 def acceptable(e: dict, must_any: list[str], avoid: list[str] | None = None,
-               allow_unknown_duration: bool = False) -> tuple[bool, str]:
+               allow_unknown_duration: bool = False, min_dur: int | None = None) -> tuple[bool, str]:
     title = e.get("title") or ""
     dur = e.get("duration") or 0
+    lo = MIN_DUR if min_dur is None else min_dur
     if not dur and allow_unknown_duration:
         pass
-    elif not (MIN_DUR <= dur <= MAX_DUR):
+    elif not (lo <= dur <= MAX_DUR):
         return False, f"duration {dur}s"
     if _BLOCK.search(title):
         return False, f"blocked word '{_BLOCK.search(title).group(0)}'"
@@ -229,6 +258,10 @@ def candidates(preset: dict, exclude: set[str] | None = None, limit: int = 8, lo
     """Ranked, filtered results. Self-heals: a strict pass (verified channel +
     official title words), then a relaxed pass (those dropped unless the preset
     sets verified_only; block words and duration limits always apply)."""
+    alt_limit = int(preset.get("alt_limit") or 12)
+    if youtube_is_blocked():
+        log("  YouTube blocked on this IP; using only non-YouTube fallback sources")
+        return alt_candidates(preset, exclude=set(exclude or set()), limit=max(limit, alt_limit), log=log)
     good = _candidates(preset, exclude, limit + offset, log, strict=True)
     if len(good) <= offset:
         log("  not enough strict matches, retrying search with relaxed title rule…")
@@ -237,7 +270,7 @@ def candidates(preset: dict, exclude: set[str] | None = None, limit: int = 8, lo
     # Non-YouTube fallbacks (Dailymotion, archive.org) sit at the end so a
     # working YouTube download is still preferred.
     have = set(exclude or set()) | {e["id"] for e in picked}
-    picked += alt_candidates(preset, exclude=have, limit=6, log=log)
+    picked += alt_candidates(preset, exclude=have, limit=alt_limit, log=log)
     return picked
 
 
@@ -280,11 +313,8 @@ def _dailymotion_search(query: str, n: int = 10, log=print) -> list[dict]:
         "sort": "relevance",
     }
     api = "https://api.dailymotion.com/videos?" + urllib.parse.urlencode(params)
-    try:
-        with urllib.request.urlopen(api, timeout=20) as resp:
-            data = json.loads(resp.read().decode("utf-8", "replace") or "{}")
-    except Exception as e:
-        log(f"    dailymotion search failed: {e}")
+    data = _http_json(api, log=log, what="dailymotion search")
+    if not isinstance(data, dict):
         return []
     out = []
     for d in data.get("list") or []:
@@ -304,10 +334,10 @@ def _dailymotion_search(query: str, n: int = 10, log=print) -> list[dict]:
     return out
 
 
-def _archive_search(query: str, n: int = 8, log=print) -> list[dict]:
+def _archive_search(query: str, n: int = 8, log=print, mediatype: str = "movies") -> list[dict]:
     """Internet Archive advanced search (yt-dlp has no archive.org search extractor)."""
     params = [
-        ("q", f"({query}) AND mediatype:(movies)"),
+        ("q", f"({query}) AND mediatype:({mediatype})"),
         ("fl[]", "identifier"),
         ("fl[]", "title"),
         ("fl[]", "runtime"),
@@ -317,11 +347,8 @@ def _archive_search(query: str, n: int = 8, log=print) -> list[dict]:
         ("sort[]", "downloads desc"),
     ]
     url = "https://archive.org/advancedsearch.php?" + urllib.parse.urlencode(params)
-    try:
-        with urllib.request.urlopen(url, timeout=20) as resp:
-            data = json.loads(resp.read().decode("utf-8", "replace") or "{}")
-    except Exception as e:
-        log(f"    archive.org search failed: {e}")
+    data = _http_json(url, log=log, what="archive.org search")
+    if not isinstance(data, dict):
         return []
     docs = (data.get("response") or {}).get("docs") or []
     out = []
@@ -361,19 +388,19 @@ def _parse_runtime(val) -> float | None:
         return None
 
 
-def alt_candidates(preset: dict, exclude: set[str] | None = None, limit: int = 6, log=print) -> list[dict]:
-    """Dailymotion + archive.org results, using the same category queries."""
+def alt_candidates(preset: dict, exclude: set[str] | None = None, limit: int = 12, log=print) -> list[dict]:
+    """Dailymotion + archive.org results. Uses alt_queries when the preset has them."""
     exclude = exclude or set()
     seen, good = set(), []
     avoid = list(preset.get("avoid") or []) + list(preset.get("avoid_extra") or [])
-    queries = (preset.get("queries") or [])[:2]
+    queries = list(preset.get("alt_queries") or []) or list(preset.get("queries") or [])
     for qi, q in enumerate(queries):
         log(f"  alt search (dailymotion): {q}")
-        for e in _dailymotion_search(q, n=10, log=log):
+        for e in _dailymotion_search(q, n=15, log=log):
             e["_q"] = qi
             _consider_alt(e, preset, avoid, exclude, seen, good, log)
         log(f"  alt search (archive.org): {q}")
-        for e in _archive_search(q, n=8, log=log):
+        for e in _archive_search(q, n=8, log=log, mediatype="movies"):
             e["_q"] = qi
             _consider_alt(e, preset, avoid, exclude, seen, good, log)
         if len(good) >= limit:
@@ -387,7 +414,8 @@ def _consider_alt(e, preset, avoid, exclude, seen, good, log) -> None:
     if vid in seen or vid in exclude:
         return
     seen.add(vid)
-    ok, why = acceptable(e, preset.get("must_any") or [], avoid, allow_unknown_duration=True)
+    ok, why = acceptable(e, preset.get("must_any") or [], avoid,
+                         allow_unknown_duration=True, min_dur=MIN_DUR_ALT)
     if ok:
         good.append(e)
     else:
@@ -444,14 +472,16 @@ def _try_wayback(entry: dict, dest_dir: Path, out: Path, fmt: str, log) -> Path:
 
 
 def _run_variants(url: str, out: Path, dest_dir: Path, stem: str, fmt: str, log,
-                  min_bytes=500_000, youtube: bool = True) -> Path:
+                  min_bytes=500_000, youtube: bool = True, extra_flags: list[str] | None = None) -> Path:
     """Run a yt-dlp download, retrying with other player clients. Fail fast on bot-checks."""
     last = "?"
     variants = CLIENT_VARIANTS[:MAX_CLIENT_TRIES] if youtube else [[]]
     bot_hits = 0
+    audio_only = out.suffix.lower() in {".m4a", ".mp3", ".ogg", ".opus", ".wav"}
+    merge = [] if audio_only else ["--merge-output-format", "mp4"]
     for i, extra in enumerate(variants):
-        cmd = _ytdlp_prefix(extra + ["--no-playlist", "-f", fmt, "--merge-output-format", "mp4",
-                                     "--retries", "2", "-o", str(out), url])
+        cmd = _ytdlp_prefix(extra + ["--no-playlist", "-f", fmt, *merge,
+                                     "--retries", "2", *(extra_flags or []), "-o", str(out), url])
         try:
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=DL_TIMEOUT)
         except subprocess.TimeoutExpired:
@@ -480,27 +510,153 @@ def _run_variants(url: str, out: Path, dest_dir: Path, stem: str, fmt: str, log,
 
 
 # ---------------------------------------------------------------- music (songs)
-def song_candidates(preset: dict, exclude: set[str] | None = None, limit: int = 4, log=print) -> list[dict]:
-    """Popular / trending songs for the category: official or high-view audio, 1.5-10 min."""
+def _jiosaavn_search(query: str, n: int = 10, log=print) -> list[dict]:
+    """JioSaavn public search API — works on datacenter IPs; yt-dlp can download the song URL."""
+    params = {
+        "__call": "search.getResults",
+        "_format": "json",
+        "_marker": "0",
+        "api_version": "4",
+        "ctx": "web6dot0",
+        "q": query,
+        "p": "1",
+        "n": str(n),
+    }
+    url = "https://www.jiosaavn.com/api.php?" + urllib.parse.urlencode(params)
+    data = _http_json(url, log=log, what="jiosaavn search")
+    if not isinstance(data, dict):
+        return []
+    out = []
+    for d in data.get("results") or []:
+        if not isinstance(d, dict):
+            continue
+        if d.get("type") and d.get("type") != "song":
+            continue
+        permalink = d.get("perma_url") or d.get("url")
+        vid = str(d.get("id") or "")
+        if not permalink or not vid:
+            continue
+        mi = d.get("more_info") or {}
+        try:
+            dur = float(mi.get("duration") or d.get("duration") or 0) or None
+        except (TypeError, ValueError):
+            dur = None
+        artists = ""
+        am = mi.get("artistMap") or {}
+        prim = am.get("primary_artists") or []
+        if isinstance(prim, list) and prim:
+            artists = ", ".join(_html.unescape(p.get("name") or "") for p in prim[:3] if isinstance(p, dict))
+        plays = d.get("play_count") or 0
+        try:
+            plays = int(plays)
+        except (TypeError, ValueError):
+            plays = 0
+        out.append({
+            "id": vid,
+            "title": _html.unescape(d.get("title") or vid),
+            "channel": artists or _html.unescape(d.get("subtitle") or "jiosaavn"),
+            "duration": dur,
+            "channel_is_verified": False,
+            "view_count": plays,
+            "url": permalink,
+            "extractor": "jiosaavn",
+        })
+    return out
+
+
+def _audiomack_search(query: str, n: int = 8, log=print) -> list[dict]:
+    """Best-effort Audiomack search (public API shape varies; empty on failure)."""
+    urls = [
+        "https://api.audiomack.com/v1/search?" + urllib.parse.urlencode({"q": query, "limit": str(n), "kind": "songs"}),
+        "https://audiomack.com/api/v2/search?" + urllib.parse.urlencode({"q": query, "limit": str(n)}),
+    ]
+    for api in urls:
+        data = _http_json(api, log=log, what="audiomack search")
+        if not data:
+            continue
+        items = []
+        if isinstance(data, dict):
+            items = data.get("results") or data.get("data") or data.get("songs") or []
+            if isinstance(items, dict):
+                items = items.get("data") or items.get("songs") or items.get("results") or []
+        elif isinstance(data, list):
+            items = data
+        out = []
+        for d in items:
+            if not isinstance(d, dict):
+                continue
+            slug = d.get("url") or d.get("permalink") or d.get("link")
+            artist = d.get("artist") or d.get("uploader") or d.get("user")
+            if isinstance(artist, dict):
+                artist = artist.get("url_slug") or artist.get("name") or artist.get("slug")
+            title = d.get("title") or d.get("name") or ""
+            vid = str(d.get("id") or title or "")
+            if isinstance(slug, str) and slug.startswith("/"):
+                slug = "https://audiomack.com" + slug
+            if not (isinstance(slug, str) and slug.startswith("http")):
+                aslug = d.get("artist_url_slug") or artist
+                tslug = d.get("url_slug") or d.get("slug")
+                if aslug and tslug:
+                    slug = f"https://audiomack.com/{aslug}/song/{tslug}"
+                else:
+                    continue
+            stats = d.get("stats") if isinstance(d.get("stats"), dict) else {}
+            plays = d.get("plays") or d.get("play_count") or stats.get("plays") or 0
+            try:
+                plays = int(plays)
+            except (TypeError, ValueError):
+                plays = 0
+            out.append({
+                "id": vid or slug.rsplit("/", 1)[-1],
+                "title": title or vid,
+                "channel": str(artist or "audiomack"),
+                "duration": d.get("duration"),
+                "channel_is_verified": False,
+                "view_count": plays,
+                "url": slug,
+                "extractor": "audiomack",
+            })
+        if out:
+            return out[:n]
+    return []
+
+
+def song_candidates(preset: dict, exclude: set[str] | None = None, limit: int = 5, log=print) -> list[dict]:
+    """Trending remix/mashup songs from hosts that download on datacenter IPs.
+
+    SoundCloud, JioSaavn, Audiomack, Dailymotion and archive.org are tried first.
+    YouTube is only searched if it is not already blocked. NCS / library tracks
+    are never kept. If nothing is found, the caller uses original source audio.
+    """
     exclude = exclude or set()
     seen, good = set(), []
     prefer = preset.get("song_prefer") or []
     queries = list(preset.get("song_queries") or [])
     for qi, q in enumerate(queries):
-        log(f"  song search: {q}")
-        for e in search(q, n=12, log=log):
-            _consider_song(e, qi, prefer, exclude, seen, good)
+        log(f"  song search (soundcloud): {q}")
+        for e in search(q, n=8, log=log, prefix=f"scsearch8:{q}"):
+            _consider_song(e, qi, prefer, exclude, seen, good, loose=True)
+        log(f"  song search (jiosaavn): {q}")
+        for e in _jiosaavn_search(q, n=8, log=log):
+            _consider_song(e, qi, prefer, exclude, seen, good, loose=True)
+        log(f"  song search (audiomack): {q}")
+        for e in _audiomack_search(q, n=8, log=log):
+            _consider_song(e, qi, prefer, exclude, seen, good, loose=True)
+        log(f"  song search (dailymotion): {q}")
+        for e in _dailymotion_search(q, n=8, log=log):
+            _consider_song(e, qi, prefer, exclude, seen, good, loose=True)
+        log(f"  song search (archive.org audio): {q}")
+        for e in _archive_search(q, n=6, log=log, mediatype="audio"):
+            _consider_song(e, qi, prefer, exclude, seen, good, loose=True)
         if len(good) >= limit * 2:
             break
-    # SoundCloud + Dailymotion if YouTube returned little (or will fail to download).
-    if len(good) < limit:
-        for qi, q in enumerate(queries[:2]):
-            log(f"  song search (soundcloud): {q}")
-            for e in search(q, n=8, log=log, prefix=f"scsearch8:{q}"):
-                _consider_song(e, qi + 10, prefer, exclude, seen, good, loose=True)
-            log(f"  song search (dailymotion): {q}")
-            for e in _dailymotion_search(q, n=8, log=log):
-                _consider_song(e, qi + 10, prefer, exclude, seen, good, loose=True)
+    if not youtube_is_blocked() and len(good) < limit * 2:
+        for qi, q in enumerate(queries):
+            log(f"  song search (youtube): {q}")
+            for e in search(q, n=12, log=log):
+                _consider_song(e, qi + 20, prefer, exclude, seen, good)
+            if len(good) >= limit * 3:
+                break
     good.sort(key=lambda e: -e["_score"])
     return good[:limit]
 
@@ -511,6 +667,7 @@ def _consider_song(e, qi, prefer, exclude, seen, good, loose: bool = False) -> N
         return
     seen.add(vid)
     title = e.get("title") or ""
+    channel = e.get("channel") or ""
     dur = e.get("duration") or 0
     if dur and not (90 <= dur <= 600):
         return
@@ -518,12 +675,16 @@ def _consider_song(e, qi, prefer, exclude, seen, good, loose: bool = False) -> N
         return
     if _MUSIC_BLOCK.search(title):
         return
+    if is_library_music(title) or is_library_music(channel) or is_library_music(e.get("url") or ""):
+        return
     views = e.get("view_count") or 0
     if not loose and views < 200_000 and not e.get("channel_is_verified"):
         return
+    remix_bonus = 2 if re.search(r"remix|mashup|mash-up|bhajan", title, re.I) else 0
+    host_bonus = 0 if is_youtube(e) else 4  # prefer hosts that download on runner IPs
     e["_score"] = (min(views / 1e6, 400) ** 0.5 + (3 if e.get("channel_is_verified") else 0)
-                   + (3 if prefer and _word_re(prefer).search(f"{title} {e.get('channel') or ''}") else 0)
-                   - 1.0 * qi)
+                   + (3 if prefer and _word_re(prefer).search(f"{title} {channel}") else 0)
+                   + remix_bonus + host_bonus - 1.0 * qi)
     good.append(e)
 
 
@@ -537,17 +698,14 @@ def download_audio(entry: dict, dest_dir: Path, log=print) -> Path:
     if not url.startswith("http"):
         url = f"https://www.youtube.com/watch?v={vid}" if is_youtube(entry) else url
     if is_youtube(entry) and youtube_is_blocked():
-        # Don't burn time on a blocked IP; caller falls back to local tracks.
+        # Don't burn time on a blocked IP; caller uses original source audio.
         raise SourceError(f"youtube_blocked: {vid}")
     log(f"  song download: {entry.get('title')} [{url}]")
     fmt = "ba[ext=m4a]/ba/b"
-    try:
-        return _run_variants(url, out, dest_dir, out.stem, fmt, log,
-                             min_bytes=300_000, youtube=is_youtube(entry))
-    except SourceError:
-        if is_youtube(entry):
-            raise
-        raise
+    # Cap size so a multi-hour archive dump cannot stall the job.
+    return _run_variants(url, out, dest_dir, out.stem, fmt, log,
+                         min_bytes=300_000, youtube=is_youtube(entry),
+                         extra_flags=["--max-filesize", "40M"])
 
 
 def entry_from_id(vid_or_url: str, log=print) -> dict | None:

@@ -265,3 +265,40 @@ def build_mix(src_audio: np.ndarray, edl: list[dict], music: np.ndarray, target:
         stats["music_db_in_speech"] = rms_db((m * duck_env[:, None])[sp_idx])
         stats["music_db_outside"] = rms_db(np.delete(m, sp_idx, axis=0)) if sp_idx.size < n else -120
     return mix.astype(np.float32), speech_out, stats
+
+
+def build_source_only_mix(src_audio: np.ndarray, edl: list[dict], target: float,
+                          sr: int = SR) -> tuple[np.ndarray, list[tuple[float, float]], dict]:
+    """Stitch the original source audio of each cut. No added music bed."""
+    n = int(round(target * sr))
+    out = np.zeros((n, 2), np.float32)
+    speech_out = []
+    if src_audio.ndim == 1:
+        src_audio = np.stack([src_audio, src_audio], 1)
+    if src_audio.size and src_audio.shape[1] == 1:
+        src_audio = np.repeat(src_audio, 2, axis=1)
+    for c in edl:
+        a, b = int(c["src_start"] * sr), int(c["src_end"] * sr)
+        seg = src_audio[a:b] if src_audio.size else np.zeros((0, 2), np.float32)
+        o = int(round(c["t0"] * sr))
+        seg = seg[: max(0, n - o)]
+        if len(seg):
+            out[o:o + len(seg)] = seg
+        for s, e in c.get("speech") or []:
+            speech_out.append((c["t0"] + max(0.0, s - c["src_start"]),
+                               c["t0"] + min(c["src_end"], e) - c["src_start"]))
+    fade = np.ones(n, np.float32)
+    fi, fo = int(0.25 * sr), int(1.2 * sr)
+    if fi < n:
+        fade[:fi] = np.linspace(0, 1, fi)
+    if fo < n:
+        fade[-fo:] = np.minimum(fade[-fo:], np.linspace(1, 0, fo))
+    out *= fade[:, None]
+    peak = float(np.abs(out).max()) or 1.0
+    if peak > 0.97:
+        out = np.tanh(out / peak * 1.6) / np.tanh(1.6) * 0.97
+    stats = {
+        "speech_intervals": [(round(s, 2), round(e, 2)) for s, e in speech_out],
+        "source_audio_only": True,
+    }
+    return out.astype(np.float32), speech_out, stats

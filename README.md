@@ -6,12 +6,12 @@ Standalone vertical Shorts renderer. Takes a 16:9 source clip, cuts it on the be
 
 v2 added **category presets**, **automatic source fetching** (`--auto`, via yt-dlp) and a **self-healing fallback loop** with a run log.
 
-v3 adds:
+v3 adds popular songs, original dialogue mixed under a ducked music bed, logo-free source picking (nothing is inpainted, blurred or cropped), and GitHub Actions rendering (`.github/workflows/render.yml`).
 
-- **Popular songs instead of NCS**: each category searches YouTube for a trending song / remix / bhajan remix (official, high-view uploads) and starts it at the chorus. The local NCS / Kevin MacLeod tracks are only a fallback.
-- **Original dialogue**: the characters' real lines are mixed in. Speech is found with a VAD, the music ducks to 25% while they talk, cuts are chosen around whole lines (never mid-sentence) and snapped to the beat.
-- **No visible branding, without touching pixels**: streaming-platform channels are skipped, a logo / channel-bug detector rejects sources with a persistent corner logo and blacklists seconds with a temporary one, and an OCR pass drops seconds with credit / title text. Nothing is inpainted, blurred or cropped.
-- **GitHub Actions rendering** (`.github/workflows/render.yml`).
+v5:
+
+- **Trending remix/mashup, never NCS**: songs are fetched from SoundCloud, JioSaavn, Audiomack, archive.org and Dailymotion (hosts that still download on GitHub runner IPs). YouTube is only tried if it is not blocked. NCS, Kevin MacLeod and generic library music are blacklisted. If no song can be fetched, the original source audio is used. Captions never mention NCS.
+- **South fallbacks**: more Telugu / Tamil / Kannada / Malayalam Dailymotion and archive.org queries, a higher fallback candidate limit, and logo detection that prefers clean time windows inside a source before rejecting it.
 
 ## Setup
 
@@ -19,12 +19,9 @@ Needs `ffmpeg`, `ffprobe`, and Python 3.10+:
 
 ```bash
 pip install -r requirements.txt        # numpy, Pillow, yt-dlp, faster-whisper (VAD), webrtcvad-wheels, rapidocr-onnxruntime
-python3 scripts/download_music.py      # optional: local fallback tracks in assets/music.json (gitignored)
 ```
 
-yt-dlp needs a JavaScript runtime for YouTube (Deno by default; Node also works).
-
-If a track is missing at render time, `make_video.py` downloads just that track. If `yt-dlp` is missing, `--auto` installs it with pip.
+yt-dlp needs a JavaScript runtime for YouTube (Deno by default; Node also works). If `yt-dlp` is missing, `--auto` installs it with pip. Songs are fetched at render time; there are no local NCS / library fallback tracks.
 
 ## Quick start
 
@@ -41,9 +38,8 @@ python3 make_video.py --category south --auto --source-offset 1 --song-offset 1 
 # Your own source file, category preset for hook + music + pacing
 python3 make_video.py --source clip.mp4 --category cricket --out out/cricket.mp4
 
-# Everything manual (original v1 behaviour)
-python3 make_video.py --source foolnight.mp4 --hook "Nobody was ready\nfor Fool Night" \
-  --music assets/music/ncs_lavida.mp3 --out out/foolnight_clean.mp4
+# Own source file, original audio (no song search)
+python3 make_video.py --source clip.mp4 --category cricket --no-song-search --out out/cricket.mp4
 
 # See which sources --auto would pick, without rendering
 python3 make_video.py --category south --auto --list-sources
@@ -65,14 +61,14 @@ Output folders are created automatically. Each render writes, next to the mp4:
 | `--auto` | Search YouTube for the category and download an official 16:9 clip (≤1080p, 60s–10min) |
 | `--hook TEXT` | Banner text, `\n` for line 2 (max 2 lines). Default: a preset hook |
 | `--hook-index N` | Use preset hook N. Default: hook matching the source title (e.g. Ramayana → "Jai Shri Ram"), else picked by output name |
-| `--music FILE` | Track file name from `assets/music.json` or a path. Default: searched song, then the preset's local tracks |
+| `--music FILE` | Song file or path. Default: a searched remix/mashup, then original source audio |
 | `--source-url URL` | YouTube URL or id to use as source (repeatable, tried first). Implies `--auto` |
 | `--source-offset N` | `--auto`: skip the first N ranked sources (batch runs) |
-| `--no-song-search` | Use only local tracks from `assets/music.json` |
+| `--no-song-search` | Do not search for a song; use the original source audio |
 | `--song-offset N` | Skip the first N ranked songs (batch runs) |
 | `--duck X` | Music gain while characters speak (default `0.25`) |
 | `--bpm N` / `--clips N` | Override BPM / number of cuts |
-| `--max-sources N` | `--auto`: how many search results to try (default 4) |
+| `--max-sources N` | `--auto`: how many search results to try (default 4; the workflow uses 12) |
 | `--exclude-id ID` | `--auto`: skip a YouTube id (repeatable), e.g. to avoid reusing a source |
 | `--list-sources` | `--auto`: print ranked candidates and exit |
 | `--work DIR` / `--log FILE` | Scratch dir (default `work/<out name>`) / run log (default `<out>.log`) |
@@ -81,8 +77,8 @@ Output folders are created automatically. Each render writes, next to the mp4:
 
 | Category | Label | Example hook | Song search (first query) | Pacing |
 | --- | --- | --- | --- | --- |
-| `bollywood` | Bollywood | Ye trailer dekh ke / rongte khade ho gaye | bollywood remix mashup | ~2.3s cuts, ~26s |
-| `south` | South Indian cinema | South wale level / hi alag hai | south indian mass song hindi | ~2.2s cuts, ~26s |
+| `bollywood` | Bollywood | Ye trailer dekh ke / rongte khade ho gaye | hindi / punjabi remix mashup | ~2.3s cuts, ~26s |
+| `south` | South Indian cinema | South wale level / hi alag hai | telugu / tamil remix mashup | ~2.2s cuts, ~26s |
 | `hollywood` | Hollywood | Hollywood ne phir / se kar dikhaya | trending english song | ~2.3s cuts, ~26s |
 | `indian_celebrity` | Indian celebrities | Superstar ka swag / hi alag hai | trending bollywood song | ~2.3s cuts, ~26s |
 | `cricket` | Cricket | Ye shot dekh ke / stadium pagal | cricket anthem official song | ~2.2s cuts, ~26s |
@@ -91,7 +87,7 @@ Output folders are created automatically. Each render writes, next to the mp4:
 | `tv_serial` | Hindi TV serial | Serial mein aaya / sabse bada twist | hindi serial title song | ~2.4s cuts, ~24s |
 | `world_best` | World's best | Duniya ki sabse / badi movie? | trending english song | ~2.2s cuts, ~26s |
 
-Each preset (in `categories.py`) defines several Hinglish hooks, search queries, title rules (must look like an official trailer / teaser / promo / highlights), preferred official channels, cut length and target length, `song_queries` / `song_prefer` for the song search, a few known-good `seeds` (YouTube ids used when search returns nothing usable), and local fallback tracks. Beats-per-cut is derived from the song BPM (read from metadata or estimated from onsets) so cuts stay on the beat (about 2.2–2.8s each). Videos come out 20–40s.
+Each preset (in `categories.py`) defines several Hinglish hooks, search queries, optional `alt_queries` for non-YouTube hosts, title rules (must look like an official trailer / teaser / promo / highlights), preferred official channels, cut length and target length, `song_queries` / `song_prefer` for the song search, and a few known-good `seeds` (YouTube ids used when search returns nothing usable and YouTube is not blocked). Beats-per-cut is derived from the song BPM (estimated from onsets) so cuts stay on the beat (about 2.2–2.8s each). Videos come out 20–40s.
 
 ### Source rules for `--auto`
 
@@ -103,11 +99,12 @@ Each preset (in `categories.py`) defines several Hinglish hooks, search queries,
 - If search finds nothing usable, the category's `seeds` are tried.
 - Downloads are cached in `work/sources/`, songs in `work/songs/` (gitignored).
 
-## Songs (v3)
+## Songs (v5)
 
-- `song_queries` are searched with yt-dlp. Kept: 1.5–10 min uploads, no live / slowed / reverb / 8D / karaoke / shorts versions, ≥200k views or a verified channel. Ranked by views, verified channel, official label (T-Series, Sony Music, Zee Music, Tips, Saregama, ...) and query order.
-- The song starts at its loudest sustained section (chorus / drop) and fades in and out. Tempo comes from metadata or onset autocorrelation.
-- Title + artist go into `caption.txt` and the json. Up to 3 searched songs are tried, then the local tracks.
+- `song_queries` are searched first on SoundCloud (`scsearch`), JioSaavn (public API), Audiomack, Dailymotion and archive.org audio — hosts that still download on datacenter IPs. YouTube is only searched if it is not already blocked.
+- Kept: 1.5–10 min tracks, no live / slowed / reverb / 8D / karaoke / shorts / nonstop versions. NCS, Kevin MacLeod and generic library music are blacklisted. Remix / mashup / bhajan titles and non-YouTube hosts rank higher.
+- The song starts at its loudest sustained section (chorus / drop) and fades in and out. Tempo comes from onset autocorrelation (or a metadata BPM if present).
+- Title + artist go into `caption.txt` and the json. Up to 5 searched songs are tried. If none can be fetched, the original source audio is used. Captions never mention NCS.
 
 ## Dialogue mix (v3)
 
@@ -120,7 +117,7 @@ Each preset (in `categories.py`) defines several Hinglish hooks, search queries,
 
 No pixels are changed; bad footage is avoided:
 
-- **Corner logo detector**: pixels that are sharp edges in the same place across many shots (corner regions) are a static overlay. Persistent across the clip → source rejected. Present only in a time window → those seconds are blacklisted.
+- **Corner logo detector**: pixels that are sharp edges in the same place across many shots (corner regions) are a static overlay. Logo-heavy seconds and 20s chunks are blacklisted, and the largest logo-free window is preferred. A source is only rejected when too little clean footage remains (never by blurring, cropping or painting over a logo).
 - **OCR** (RapidOCR): seconds with credit / title / brand text on the picture are skipped (bottom-centre subtitles are allowed).
 - The final video is checked again for a corner logo and plate text. A failure rejects that source.
 
@@ -130,9 +127,9 @@ No pixels are changed; bad footage is avoided:
 
 1. **Search**: each query is retried 3×. If no result passes strict rules, a relaxed pass runs.
 2. **Source**: next search result if a download fails, the clip is not 16:9, too short, or has too little clean footage. A failed download is retried at **720p**, then **480p**.
-3. **Music**: next track in the preset list, then generic fallbacks, if a track is missing, fails to download (3 tries, atomic write), is silent, or breaks the render.
+3. **Music**: next fetched remix/mashup if a song is missing, fails to download, is silent, or breaks the render. If none work, the original source audio is used. Library / NCS tracks are never tried.
 4. **Dialogue**: no clean line in a source → next source (music-only render kept as last resort). Too quiet → deeper ducking and re-render.
-5. **Logo**: persistent logo in the source or the output → next source.
+5. **Logo**: too little logo-free footage in the source, or a logo in the output → next source (clean windows are tried first).
 6. **QC**: up to 3 render rounds per source/track. Failed output seconds (and their neighbours) are blacklisted and new cuts are picked. A background that is too dark gets brighter each round. If the source has too few clean windows, fewer cuts are used (still ≥20s).
 7. **yt-dlp blocks**: every search / download retries with other player clients (`web_safari`, `tv`, `mweb`, `ios`, Node runtime) with sleeps between requests.
 8. **Unexpected errors** are logged with a traceback and the loop moves on.
@@ -165,27 +162,7 @@ QC: the source is scored at 2 fps on the active picture area. A second is reject
 3. Each category × count runs as its own matrix job (`--source-offset` / `--song-offset` = index, so batch videos differ).
 4. Download the `short-<category>-<n>` artifact (mp4, caption.txt, json, log), kept 7 days.
 
-The job installs ffmpeg, Noto fonts (Hindi), Deno and the newest yt-dlp. If YouTube blocks the runner, the code switches player clients and sources; the step then retries the whole render 3 times with waits and fails with a clear `::error::` if all attempts fail. A daily `schedule` is in the file, commented out.
-
-## Local fallback tracks
-
-Used only when song search fails or with `--no-song-search` (credits are written automatically):
-
-| File | Track | Source | BPM | License |
-| --- | --- | --- | --- | --- |
-| `ncs_lavida.mp3` | Cryjaxx, MVRPHiN & Lucy Malfroy - LA VIDA! | NCS | 129 | NCS Usage Policy: free for YouTube/Twitch UGC incl. monetised, credit required in description |
-| `ncs_montagemindia.mp3` | GxL - MONTAGEM INDIA | NCS | 129 | NCS Usage Policy: free for YouTube/Twitch UGC incl. monetised, credit required in description |
-| `ncs_fellshortofhell.mp3` | THIRST - fellshortofhell | NCS | 152 | NCS Usage Policy: free for YouTube/Twitch UGC incl. monetised, credit required in description |
-| `ncs_godless.mp3` | Ailow - Godless | NCS | 152 | NCS Usage Policy: free for YouTube/Twitch UGC incl. monetised, credit required in description |
-| `ncs_adrenaline.mp3` | Slowboy, Zeli - Adrenaline | NCS | 129 | NCS Usage Policy: free for YouTube/Twitch UGC incl. monetised, credit required in description |
-| `ncs_teamo.mp3` | c80 - teamo | NCS | 117 | NCS Usage Policy: free for YouTube/Twitch UGC incl. monetised, credit required in description |
-| `ncs_fireflies.mp3` | Krezus & surreal_dvd - Fireflies | NCS | 172 | NCS Usage Policy: free for YouTube/Twitch UGC incl. monetised, credit required in description |
-| `ncs_flowersinmyhead.mp3` | DIECXLD, Prod. 94 - flowers in my head | NCS | 86 | NCS Usage Policy: free for YouTube/Twitch UGC incl. monetised, credit required in description |
-| `ncs_tequilainmycup.mp3` | Conni - Tequila In My Cup | NCS | 129 | NCS Usage Policy: free for YouTube/Twitch UGC incl. monetised, credit required in description |
-| `ncs_favela.mp3` | MXZI, Deno - FAVELA | NCS | 86 | NCS Usage Policy: free for YouTube/Twitch UGC incl. monetised, credit required in description |
-| `km_Impact_Prelude.mp3` | Kevin MacLeod - Impact Prelude | incompetech | 161 | CC BY 4.0 |
-| `km_Heartbreaking.mp3` | Kevin MacLeod - Heartbreaking | incompetech | 78 | CC BY 4.0 |
-| `km_Intrepid.mp3` | Kevin MacLeod - Intrepid | incompetech | 89 | CC BY 4.0 |
+The job installs ffmpeg, Noto fonts (Hindi), Deno and the newest yt-dlp. If YouTube blocks the runner, the code fails fast, switches to Dailymotion / archive.org (and song hosts like JioSaavn / SoundCloud), and a workflow `retry` job can re-dispatch failed categories on a fresh runner (up to 2 automatic reruns). A daily `schedule` is in the file, commented out. Successful mp4s are published as a public GitHub Release (`render-<run_id>`).
 
 ## Files
 
@@ -195,8 +172,8 @@ Used only when song search fails or with `--no-song-search` (credits are written
 - `audio_mix.py` — decode, VAD, BPM / chorus detection, ducked dialogue mix
 - `logo.py` — corner logo detector, OCR text detection
 - `.github/workflows/render.yml` — GitHub Actions render
-- `scripts/download_music.py` — fetch local fallback tracks from `assets/music.json`
-- `assets/music.json` — local fallback track metadata and credits
+- `scripts/download_music.py` — optional helper; `assets/music.json` ships with no tracks (NCS / library music is skipped)
+- `assets/music.json` — empty local-track list (songs are fetched at render time)
 - `fonts/ArchivoBlack-Regular.ttf` — [Archivo Black](https://fonts.google.com/specimen/Archivo+Black), SIL Open Font License
 
 Do not commit `.mp3`, `.mp4`, `.m4a`, `out/` or `work/`.
