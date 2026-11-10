@@ -1,0 +1,179 @@
+name: Render Shorts
+
+# Renders vertical Shorts on GitHub-hosted runners (free minutes) and uploads
+# them as artifacts. No secrets needed.
+on:
+  # Editing render-request.json on main starts a render (category/count/hook inside it).
+  push:
+    branches: [main]
+    paths: [render-request.json]
+  workflow_dispatch:
+    inputs:
+      category:
+        description: "Category, comma list, or 'all' (bollywood, south, hollywood, indian_celebrity, cricket, devotional, hindi_love, tv_serial, world_best)"
+        required: true
+        default: "bollywood"
+      count:
+        description: "Videos per category (1-5)"
+        required: true
+        default: "1"
+      hook:
+        description: "Optional banner hook (use \\n for line 2). Empty = preset hook"
+        required: false
+        default: ""
+  # Optional daily run at 09:00 IST (03:30 UTC). Uncomment to enable.
+  # schedule:
+  #   - cron: "30 3 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: render-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: m
+        name: Build matrix
+        env:
+          IN_CATEGORY: ${{ inputs.category }}
+          IN_COUNT: ${{ inputs.count }}
+        run: |
+          if [ -z "$IN_CATEGORY" ] && [ -f render-request.json ]; then
+            export CATEGORY=$(python3 -c "import json;print(json.load(open('render-request.json')).get('category','bollywood'))")
+            export COUNT=$(python3 -c "import json;print(json.load(open('render-request.json')).get('count',1))")
+          else
+            export CATEGORY="${IN_CATEGORY:-bollywood,south,cricket,devotional}"
+            export COUNT="${IN_COUNT:-1}"
+          fi
+          python3 - <<'PY'
+          import json, os
+          known = ["bollywood", "south", "hollywood", "indian_celebrity", "cricket",
+                   "devotional", "hindi_love", "tv_serial", "world_best"]
+          raw = os.environ["CATEGORY"].strip().lower()
+          cats = known if raw == "all" else [c.strip() for c in raw.split(",") if c.strip()]
+          bad = [c for c in cats if c not in known]
+          if bad:
+              raise SystemExit(f"::error::unknown category {bad}; choose from {known}")
+          try:
+              n = max(1, min(5, int(os.environ["COUNT"])))
+          except ValueError:
+              raise SystemExit("::error::count must be a number 1-5")
+          include = [{"category": c, "index": i} for c in cats for i in range(n)]
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write("matrix=" + json.dumps({"include": include}) + "\n")
+          print(json.dumps(include, indent=1))
+          PY
+
+  render:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    name: ${{ matrix.category }} #${{ matrix.index }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      # yt-dlp needs a JavaScript runtime for YouTube (Deno is its default)
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: Install ffmpeg + fonts (Noto for Hindi)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg fonts-noto-core fonts-dejavu-core
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -U "yt-dlp[default]"   # newest extractor + EJS = fewest YouTube blocks
+
+      - name: Fetch local fallback tracks
+        continue-on-error: true
+        run: python scripts/download_music.py
+
+      - name: Render
+        env:
+          CAT: ${{ matrix.category }}
+          IDX: ${{ matrix.index }}
+          HOOK: ${{ inputs.hook }}
+        run: |
+          mkdir -p out
+          args=(--category "$CAT" --auto --max-sources 8
+                --source-offset "$IDX" --song-offset "$IDX"
+                --out "out/${CAT}_${IDX}.mp4")
+          if [ -n "$HOOK" ]; then args+=(--hook "$HOOK"); fi
+          # make_video.py already retries yt-dlp with other player clients, other
+          # sources, other songs and lower resolutions. If the whole run still
+          # fails (e.g. YouTube bot-blocks this runner IP), wait and retry.
+          for attempt in 1 2 3; do
+            if python make_video.py "${args[@]}"; then
+              echo "### ✅ ${CAT} #${IDX} rendered" >> "$GITHUB_STEP_SUMMARY"
+              python - <<'PY' >> "$GITHUB_STEP_SUMMARY" || true
+          import json, glob
+          for f in glob.glob("out/*.json"):
+              d = json.load(open(f))
+              print(f"- **{d['category']}**: {d['duration']:.1f}s | source: {d['source'].get('title')} {d['source'].get('url')} "
+                    f"| song: {(d.get('song') or {}).get('title')} | dialogue lines: {(d.get('dialogue') or {}).get('lines')}")
+          PY
+              exit 0
+            fi
+            echo "::warning::render attempt $attempt for ${CAT} #${IDX} failed; retrying in $((attempt * 90))s"
+            sleep $((attempt * 90))
+          done
+          echo "::error::All render attempts failed for ${CAT} #${IDX}. YouTube may be blocking yt-dlp on this runner; see the log artifact."
+          exit 1
+
+      - name: Upload video + caption + logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: short-${{ matrix.category }}-${{ matrix.index }}
+          path: |
+            out/*.mp4
+            out/*.caption.txt
+            out/*.json
+            out/*.log
+          retention-days: 7
+          if-no-files-found: warn
+
+  # Publishes every rendered video as a public GitHub Release so they can be
+  # downloaded without login. The run finishing (pass or fail) pings the bot via
+  # its GitHub CI listener on main, and the bot sends the videos to BiBi.
+  publish:
+    needs: render
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create release with videos
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls -la dist || true
+          shopt -s nullglob
+          files=(dist/*.mp4 dist/*.caption.txt dist/*.json)
+          if [ ${#files[@]} -eq 0 ]; then echo "::error::no videos to publish"; exit 1; fi
+          tag="render-${{ github.run_id }}"
+          gh release create "$tag" "${files[@]}" --repo "${{ github.repository }}" \
+            --title "Render ${{ github.run_number }}" --notes "Videos from run ${{ github.run_id }}"
+
