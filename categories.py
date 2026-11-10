@@ -36,6 +36,84 @@ BLOCK_WORDS = [
 SERIES_WORDS = ["series", "season", "episode", "streaming", "originals", "web show"]
 SOUTH_WORDS = ["telugu", "tamil", "kannada", "malayalam", "sony music south", "tollywood", "kollywood"]
 
+# Stars and films that mark a title as real South Indian cinema.
+SOUTH_STARS = [
+    "allu arjun", "prabhas", "yash", "vijay", "thalapathy", "rajinikanth", "rajini",
+    "mahesh babu", "jr ntr", "ntr", "ram charan", "rashmika", "samantha",
+    "sai pallavi", "keerthy suresh", "nani", "dhanush", "suriya", "sivakarthikeyan",
+    "pawan kalyan", "chiranjeevi", "nayanthara", "tamannaah", "vijay devarakonda",
+    "nithiin", "tovino", "fahadh", "dulquer", "mohanlal", "mammootty",
+    "sudeep", "kajal aggarwal",
+]
+SOUTH_FILMS = [
+    "pushpa", "kgf", "salaar", "leo", "kalki", "devara", "jailer",
+    "rrr", "baahubali", "bahubali", "kantara", "vikram", "master",
+    "coolie", "game changer", "dasara", "petta", "kabali", "annaatthe",
+    "varisu", "beast", "kanguva", "ponniyin selvan", "maharaja",
+    "lucky bhaskar", "manjummel boys", "hanu-man",
+]
+SOUTH_MARKERS = SOUTH_WORDS + SOUTH_STARS + SOUTH_FILMS
+
+# Dubbed foreign / Hollywood titles must never be picked for the south category.
+HOLLYWOOD_FRANCHISES = [
+    "hollywood", "godzilla", "kong", "king kong", "monsterverse", "skull island",
+    "marvel", "avengers", "mcu", "spider-man", "spiderman", "iron man",
+    "captain america", "guardians of the galaxy", "doctor strange",
+    "black panther", "thor", "deadpool", "x-men", "x men", "wolverine",
+    "venom", "the marvels", "ant-man", "ant man", "eternals", "shang-chi",
+    "fantastic four", "black widow",
+    "fast & furious", "fast and furious", "fast furious", "furious 7",
+    "fast five", "fast x", "f9 the fast saga",
+    "batman", "superman", "justice league", "aquaman", "wonder woman",
+    "the batman", "joker", "dc universe",
+    "jurassic park", "jurassic world", "jurassic",
+    "star wars", "star trek", "transformers",
+    "mission impossible", "mission: impossible", "john wick",
+    "harry potter", "fantastic beasts", "hogwarts",
+    "lord of the rings", "the hobbit", "rings of power",
+    "pirates of the caribbean", "indiana jones", "james bond", "007",
+    "avatar", "dune", "the matrix", "terminator", "top gun",
+    "oppenheimer", "barbie", "jumanji", "minions", "despicable me",
+    "toy story", "frozen", "moana", "inside out", "finding nemo",
+    "kung fu panda", "ice age", "how to train your dragon", "shrek",
+    "hunger games", "planet of the apes", "pacific rim", "the meg", "meg 2",
+    "ghostbusters", "men in black", "the conjuring", "annabelle",
+    "final destination", "a quiet place", "twilight", "creed", "bourne",
+    "gladiator", "sonic the hedgehog", "super mario bros", "minecraft movie",
+    "wicked", "beetlejuice", "alien romulus", "wonka", "the fall guy", "bad boys",
+]
+DUBBED_FOREIGN_WORDS = ["hollywood", "dubbed", "hindi dubbed", "english dubbed"]
+
+_SOUTH_MARK_RE = re.compile(
+    r"(?<![a-z0-9])(" + "|".join(re.escape(w) for w in SOUTH_MARKERS) + r")(?![a-z0-9])",
+    re.I,
+)
+_HOLLYWOOD_FRANCHISE_RE = re.compile(
+    r"(?<![a-z0-9])(" + "|".join(re.escape(w) for w in HOLLYWOOD_FRANCHISES) + r")(?![a-z0-9])",
+    re.I,
+)
+_DUBBED_RE = re.compile(
+    r"(?<![a-z0-9])((hindi|english|tamil|telugu|kannada|malayalam)\s+)?dubbed(?![a-z0-9])",
+    re.I,
+)
+
+
+def is_dubbed_foreign(text: str) -> bool:
+    """True if a title/channel is dubbed foreign or Hollywood content, not a South film.
+
+    Franchise names (Godzilla, Marvel, Fast & Furious, ...) always reject.
+    A bare 'dubbed' / 'Hindi dubbed' title also rejects, unless a known South
+    star or film is in the same text (so a Pushpa Hindi-dubbed trailer still passes).
+    """
+    if not text:
+        return False
+    if _HOLLYWOOD_FRANCHISE_RE.search(text):
+        return True
+    if _DUBBED_RE.search(text) and not _SOUTH_MARK_RE.search(text):
+        return True
+    return False
+
+
 # Streaming platforms put their logo on every upload -> never use them as a source.
 STREAMING_CHANNELS = [
     "netflix", "prime video", "primevideo", "amazon prime", "amazon mx", "jiohotstar", "hotstar",
@@ -119,37 +197,67 @@ CATEGORIES: dict[str, dict] = {
             "Pan India\nblockbuster loading",
         ],
         "queries": [
+            "allu arjun official trailer",
+            "prabhas official trailer",
+            "yash kgf official trailer",
+            "thalapathy vijay official trailer",
+            "rajinikanth official trailer",
+            "mahesh babu official trailer",
+            "jr ntr official trailer",
+            "ram charan official trailer",
+            "rashmika official trailer",
+            "samantha official trailer",
+            "sai pallavi official trailer",
+            "keerthy suresh official trailer",
+            "pushpa official trailer telugu",
+            "kgf official trailer",
+            "salaar official trailer",
+            "leo vijay official trailer",
+            "kalki official trailer",
+            "devara official trailer",
+            "jailer official trailer",
             "telugu movie official trailer 2026",
             "tamil movie official trailer 2026",
             "kannada movie official trailer 2026",
             "malayalam movie official trailer 2026",
-            "telugu official teaser 2026",
-            "tamil official teaser 2026",
-            "pan india movie official trailer",
             "tollywood official trailer",
             "kollywood official trailer",
-            "telugu movie official trailer hindi 2026",
         ],
         "alt_queries": [
+            "pushpa official trailer",
+            "kgf official trailer",
+            "salaar official trailer",
+            "allu arjun official trailer",
+            "prabhas official trailer",
+            "yash official trailer",
+            "vijay official trailer tamil",
+            "rajinikanth official trailer",
+            "mahesh babu official trailer",
+            "ntr official trailer",
+            "ram charan official trailer",
+            "rashmika official trailer",
+            "samantha official trailer",
+            "sai pallavi official trailer",
+            "keerthy suresh official trailer",
+            "leo official trailer tamil",
+            "kalki official trailer",
+            "devara official trailer",
+            "jailer official trailer",
+            "rrr official trailer",
+            "baahubali official trailer",
+            "kantara official trailer",
             "telugu official trailer",
             "tamil official trailer",
             "kannada official trailer",
             "malayalam official trailer",
-            "telugu movie official teaser",
-            "tamil movie official teaser",
-            "kannada movie official teaser",
-            "malayalam movie official teaser",
             "tollywood official trailer",
             "kollywood official trailer",
-            "south indian official trailer",
-            "telugu official glimpse",
-            "tamil official glimpse",
-            "pan india official trailer",
         ],
         "alt_limit": 16,
         "must_any": ["trailer", "teaser", "glimpse"],
         "avoid": SERIES_WORDS,
-        "prefer": SOUTH_WORDS + ["pan india", "hombale", "mythri", "sun pictures", "lyca"],
+        "reject_foreign_dubs": True,
+        "prefer": SOUTH_MARKERS + ["pan india", "hombale", "mythri", "sun pictures", "lyca"],
         "cut_s": 2.2,
         "target_s": 26,
         "song_queries": [

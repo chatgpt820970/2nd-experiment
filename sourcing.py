@@ -14,7 +14,7 @@ from pathlib import Path
 
 from categories import (
     BLOCK_WORDS, MUSIC_BLOCK_WORDS, OFFICIAL_WORDS, STREAMING_CHANNELS,
-    is_library_music,
+    is_dubbed_foreign, is_library_music,
 )
 
 MIN_DUR = 60      # need enough footage for ~10 non-overlapping beat cuts
@@ -219,7 +219,8 @@ def search(query: str, n: int = 15, log=print, prefix: str | None = None) -> lis
 
 
 def acceptable(e: dict, must_any: list[str], avoid: list[str] | None = None,
-               allow_unknown_duration: bool = False, min_dur: int | None = None) -> tuple[bool, str]:
+               allow_unknown_duration: bool = False, min_dur: int | None = None,
+               reject_foreign_dubs: bool = False) -> tuple[bool, str]:
     title = e.get("title") or ""
     dur = e.get("duration") or 0
     lo = MIN_DUR if min_dur is None else min_dur
@@ -232,6 +233,8 @@ def acceptable(e: dict, must_any: list[str], avoid: list[str] | None = None,
     if is_streaming(e):
         return False, "streaming-platform upload (platform logo)"
     text = f"{title} | {e.get('channel') or ''}"
+    if reject_foreign_dubs and is_dubbed_foreign(text):
+        return False, "dubbed foreign / Hollywood title"
     if avoid and _word_re(avoid).search(text):
         return False, f"avoid word '{_word_re(avoid).search(text).group(0)}'"
     if must_any and not _word_re(must_any).search(title):
@@ -286,7 +289,8 @@ def _candidates(preset, exclude, limit, log, strict: bool) -> list[dict]:
                 continue
             seen.add(vid)
             e["_q"] = qi
-            ok, why = acceptable(e, preset.get("must_any", []) if strict else [], avoid)
+            ok, why = acceptable(e, preset.get("must_any", []) if strict else [], avoid,
+                                 reject_foreign_dubs=bool(preset.get("reject_foreign_dubs")))
             need_verified = strict or preset.get("verified_only")
             if ok and need_verified and not e.get("channel_is_verified"):
                 ok, why = False, "channel not verified"
@@ -415,7 +419,8 @@ def _consider_alt(e, preset, avoid, exclude, seen, good, log) -> None:
         return
     seen.add(vid)
     ok, why = acceptable(e, preset.get("must_any") or [], avoid,
-                         allow_unknown_duration=True, min_dur=MIN_DUR_ALT)
+                         allow_unknown_duration=True, min_dur=MIN_DUR_ALT,
+                         reject_foreign_dubs=bool(preset.get("reject_foreign_dubs")))
     if ok:
         good.append(e)
     else:
