@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Download the royalty-free tracks listed in assets/music.json.
+"""Optional downloader for any tracks still listed in assets/music.json.
 
-Audio files are gitignored. Run this once before rendering, or let
-make_video.py fetch a single missing track automatically.
+v5 does not ship local library tracks. NCS, Kevin MacLeod and generic
+library music are skipped even if someone adds them back to the file.
+The renderer fetches a trending remix at run time, or uses source audio.
 
-    python3 scripts/download_music.py                 # all tracks
-    python3 scripts/download_music.py ncs_teamo.mp3   # only these files
+    python3 scripts/download_music.py                 # all allowed tracks
+    python3 scripts/download_music.py some_track.mp3  # only these files
 """
 from __future__ import annotations
 
@@ -57,10 +58,25 @@ def download_one(t: dict, retries: int = 3) -> Path:
     raise RuntimeError(f"could not download {t['file']}: {last}")
 
 
+def _is_library(t: dict) -> bool:
+    blob = " ".join(str(t.get(k, "")) for k in ("file", "title", "artist", "source", "credit"))
+    return bool(
+        __import__("re").search(r"(^|[^a-z])ncs([^a-z]|$)|macleod|incompetech|nocopyrightsounds",
+                                blob, __import__("re").I)
+    )
+
+
 def download_all(only: list[str] | None = None) -> list[Path]:
     saved, failed = [], []
-    for t in tracks():
+    listed = tracks()
+    if not listed:
+        print("No local tracks in assets/music.json (trending songs are fetched at render time).")
+        return []
+    for t in listed:
         if only and t["file"] not in only:
+            continue
+        if _is_library(t):
+            print(f"Skipping library/NCS track {t.get('file')}", file=sys.stderr)
             continue
         try:
             saved.append(download_one(t))
