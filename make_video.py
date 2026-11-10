@@ -1031,6 +1031,9 @@ def main(argv=None) -> int:
             except SourceError as e:
                 log(f"  source {label} unusable: {e}")
                 attempts.append(f"{label}: {e}")
+                # Bot-check / HTTP 403 is an IP problem, not a resolution problem.
+                if sourcing.is_hard_block(e):
+                    break
                 continue
             render_failed = False
             hook = choose_hook(args, preset, out_path.stem, info.get("title") or "")
@@ -1057,7 +1060,8 @@ def main(argv=None) -> int:
                     continue
                 src_info = {"title": info.get("title"), "id": info.get("id"),
                             "channel": info.get("channel"),
-                            "url": f"https://www.youtube.com/watch?v={info['id']}" if entry else ""}
+                            "url": (info.get("url") or (
+                                f"https://www.youtube.com/watch?v={info['id']}" if entry else ""))}
                 result = (music, hook, src_info, report, list(attempts))
                 no_dialogue = not (report.get("dialogue") or {}).get("lines")
                 if want_dialogue and no_dialogue and fallback is None and si < len(sources) - 1:
